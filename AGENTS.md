@@ -138,6 +138,10 @@
   call. The queue file is re-read per item.
 - **Installers never take over a name they don't own.** `install.sh` links
   `~/.local/bin/tvcast` only if it is free or already resolves into this plugin.
+  The menu snippet never calls that link: it runs the bundled
+  `$HOME/.config/omarchy/plugins/megascan.tvcast/bin/tvcast`, because `when` checks run
+  as soon as the menu opens. Temp and backup files are created fresh (`mkstemp`/`mktemp`),
+  never at a fixed path that could already be a symlink.
   Menu edits (install and uninstall) touch only lines that *start* with one of the
   snippet's exact keys, or the `// tvcast: ` comment. A user's `"trigger.castle"`, a
   mention inside a string, or a one-line file are left alone. The menu is rewritten

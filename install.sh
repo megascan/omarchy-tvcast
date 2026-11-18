@@ -47,9 +47,9 @@ fi
 if [[ ${1:-} == --menu ]]; then
   mkdir -p "$(dirname "$menu")"
   [[ -s $menu ]] || printf '{\n}\n' >"$menu"
-  cp "$menu" "$menu.bak.$(date +%s)"
+  cp "$menu" "$(mktemp "$menu.bak.XXXXXX")"
   python3 -I - "$menu" "$here/menu/omarchy-menu.snippet.jsonc" <<'PY'
-import os, re, sys
+import os, re, sys, tempfile
 path, snip = sys.argv[1], sys.argv[2]
 # Only our own lines: a line that starts with one of the snippet's keys, or
 # the snippet's comment. Anything else (a "trigger.castle" entry, a one-line
@@ -63,11 +63,15 @@ head = text[:end].rstrip()
 if head and not head.endswith(("{", ",")):
     head += ","
 real = os.path.realpath(path)  # a dotfiles symlink stays a symlink
-tmp = real + ".tvcast.tmp"
-with open(tmp, "w") as f:
-    f.write(head + "\n" + open(snip).read() + text[end:])
-os.chmod(tmp, os.stat(real).st_mode & 0o7777)
-os.replace(tmp, real)
+fd, tmp = tempfile.mkstemp(prefix=".tvcast.", dir=os.path.dirname(real))
+try:
+    with os.fdopen(fd, "w") as f:
+        f.write(head + "\n" + open(snip).read() + text[end:])
+    os.chmod(tmp, os.stat(real).st_mode & 0o7777)
+    os.replace(tmp, real)
+except BaseException:
+    os.unlink(tmp)
+    raise
 PY
   echo "added menu entries (Trigger > Cast to TV); backup saved next to $menu"
 fi
