@@ -136,6 +136,12 @@
   keeps terminal escape sequences (OSC 52 and the like) out of `tvcast devices`.
 - **The runner re-validates the queue's device URL** with `lan_url` before every go2tv
   call. The queue file is re-read per item.
+- **Only touch systemd units tvcast created.** The runner is `megascan-tvcast.service`
+  (`tvcast.service` up to 0.5.4 is still recognised). `owns_unit` requires
+  `Transient=yes` and an ExecStart of this plugin's `tvcast _run` before any
+  stop/reset/is-active decision; start refuses if a foreign unit holds the name.
+  Menu `when` checks and `uninstall.sh` go through `tvcast active` / `tvcast _stop-owned`,
+  never raw `systemctl` on a unit name.
 - **Installers never take over a name they don't own.** `install.sh` links
   `~/.local/bin/tvcast` only if it is free or already resolves into this plugin.
   The menu snippet never calls that link: it runs the bundled

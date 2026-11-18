@@ -24,7 +24,7 @@
 #   tvcast pick-device               discover and choose the TV to cast to
 #   tvcast active | has-queue [min]  exit 0 while casting / while queued
 #
-# Playback runs as the transient user unit tvcast.service ("tvcast _run"),
+# Playback runs as the transient user unit megascan-tvcast.service ("tvcast _run"),
 # which plays the queue item by item: go2tv under script(1) (its CLI needs a
 # terminal), and the end of each file is detected by polling the TV (DLNA)
 # or the Chromecast's media status, plus go2tv exiting at the end (Chromecast).
@@ -35,7 +35,8 @@
 set -uo pipefail
 
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
-UNIT=tvcast.service
+UNIT=megascan-tvcast.service
+LEGACY_UNIT=tvcast.service # 0.5.4 and older
 GO2TV=${TVCAST_GO2TV:-$(command -v go2tv || echo "$HOME/.local/bin/go2tv")}
 CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/tvcast
 STATE_FILE=$CACHE_DIR/state.json
@@ -103,7 +104,22 @@ die() {
   exit 1
 }
 
-is_active() { systemctl --user -q is-active "$UNIT"; }
+# A unit is ours only if it is transient and its main command is this plugin's
+# "tvcast _run"; anything else with the same name is left alone.
+owns_unit() {
+  local props
+  props=$(systemctl --user show "$1" -p Transient -p ExecStart 2>/dev/null) || return 1
+  [[ $props == *Transient=yes* ]] || return 1
+  [[ $props == *" $SELF _run "* || $props == *"/megascan.tvcast/bin/tvcast _run "* ]]
+}
+active_unit() {
+  local u
+  for u in "$UNIT" "$LEGACY_UNIT"; do
+    systemctl --user -q is-active "$u" 2>/dev/null && owns_unit "$u" && { echo "$u"; return 0; }
+  done
+  return 1
+}
+is_active() { active_unit >/dev/null; }
 
 # go2tv before 2.5.0 re-fetches the device description and follows whatever
 # controlURL/URLBase the device advertises, bypassing our origin checks.
@@ -831,15 +847,22 @@ start_runner() {
     TVCAST_CAST_HELPER TVCAST_ALLOW_LOOPBACK; do
     [[ -n ${!v:-} ]] && env+=(--setenv="$v=${!v}")
   done
-  systemctl --user reset-failed "$UNIT" 2>/dev/null
+  owns_unit "$UNIT" && systemctl --user reset-failed "$UNIT" 2>/dev/null
+  if [[ $(systemctl --user show "$UNIT" -p LoadState --value 2>/dev/null) == loaded ]] && ! owns_unit "$UNIT"; then
+    die "A user unit named $UNIT exists that tvcast did not create; tvcast left it alone."
+  fi
   systemd-run --user --quiet --collect --unit "$UNIT" --description "tvcast queue player" \
     "${env[@]}" -p "ExecStopPost=$SELF _cleanup" -- nice -n 5 "$SELF" _run ||
     die "Could not start the cast service."
 }
 
 stop_runner() {
-  is_active && systemctl --user stop "$UNIT" 2>/dev/null
-  systemctl --user reset-failed "$UNIT" 2>/dev/null
+  local u
+  for u in "$UNIT" "$LEGACY_UNIT"; do
+    owns_unit "$u" || continue
+    systemctl --user -q is-active "$u" 2>/dev/null && systemctl --user stop "$u" 2>/dev/null
+    systemctl --user reset-failed "$u" 2>/dev/null
+  done
   return 0
 }
 
@@ -856,7 +879,7 @@ play_at() {
   start_runner
 }
 
-# ---------- runner (main process of tvcast.service) ----------
+# ---------- runner (main process of megascan-tvcast.service) ----------
 
 PLAYER_PID=""
 
@@ -1274,6 +1297,7 @@ case ${1:-cast} in
   has-queue) (($(q_count) >= $(uint "${2:-1}"))) ;;
   _run) cmd_run ;;
   _cleanup) cmd_cleanup ;;
+  _stop-owned) stop_runner ;;
   -h | --help | help) sed -n '3,31p' "$SELF" | sed 's/^# \{0,1\}//' ;;
   *) echo "tvcast: unknown command '$1' (try tvcast help)" >&2; exit 2 ;;
 esac

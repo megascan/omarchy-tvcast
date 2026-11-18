@@ -127,9 +127,11 @@ tvcast volume [N|+N|-N|up|down] | mute [on|off|toggle]
 tvcast status [--json] | devices [--json] | pick-device
 ```
 
-Playback runs as the transient user service `tvcast.service` (created with
+Playback runs as the transient user service `megascan-tvcast.service` (created with
 `systemd-run --user`, removed when it stops), so you can also stop it with
-`systemctl --user stop tvcast`. tvcast touches no other service and never uses sudo.
+`systemctl --user stop megascan-tvcast`. tvcast only stops or resets a unit it
+created itself: a transient unit whose command is this plugin's `tvcast _run`. It
+touches no other service and never uses sudo.
 Playback runs go2tv under `script(1)`, because go2tv's CLI needs a terminal.
 State lives in `~/.local/state/tvcast/` (queue) and `~/.cache/tvcast/` (now
 playing, last TV, go2tv's `session.log`). Both directories and their files are

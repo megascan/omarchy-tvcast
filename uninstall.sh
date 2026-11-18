@@ -5,7 +5,7 @@ set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 id=$(jq -r .id "$here/manifest.json")
 
-systemctl --user stop tvcast.service 2>/dev/null
+"$here/bin/tvcast" _stop-owned 2>/dev/null
 [[ $(readlink -f "$HOME/.local/bin/tvcast") == */"$id"/bin/tvcast ]] && rm -f "$HOME/.local/bin/tvcast"
 state=${XDG_STATE_HOME:-$HOME/.local/state}/tvcast
 # Only the exact lines install.sh recorded, in the file it recorded them for (even if
