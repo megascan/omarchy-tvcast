@@ -5,11 +5,11 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 
-// Bar widget and queue manager for tvcast. Hidden while nothing is queued or
-// casting. It watches tvcast's state files (no timers while idle) and polls
+// Bar widget and queue manager for tvcast. Idle, it is just a cast icon. It
+// watches tvcast's state files (no timers while idle) and polls
 // `tvcast status --json` every two seconds only while a cast is running.
 //   Left click: open the queue panel   Middle click: pause/resume
-//   Right click: stop                  Scroll: seek 30 seconds
+//   Right click: stop (while casting)  Scroll: seek 30 seconds
 BarWidget {
   id: root
   moduleName: "megascan.tvcast"
@@ -35,7 +35,7 @@ BarWidget {
 
   readonly property int count: items.length
   readonly property bool hasQueue: count > 0
-  readonly property bool shown: casting || hasQueue
+  readonly property bool engaged: casting || hasQueue
   readonly property bool paused: transport === "PAUSED_PLAYBACK"
   readonly property bool playing: casting && !paused
   readonly property string stateGlyph: !casting ? "󰓛" : (paused ? "󰏤" : "󰐊")
@@ -43,10 +43,8 @@ BarWidget {
 
   function close() { popupOpen = false }
 
-  visible: shown
-  implicitWidth: shown ? button.implicitWidth : 0
+  implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
-  onShownChanged: if (!shown) popupOpen = false
 
   Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
 
@@ -73,11 +71,21 @@ BarWidget {
     root.currentIndex = Math.max(0, Math.min(Number(d.index) || 0, Math.max(0, list.length - 1)))
     root.casting = d.active === true
     root.title = root.plain(d.title || (list[root.currentIndex] ? list[root.currentIndex].title : ""))
-    root.deviceName = root.plain(d.deviceName || "TV").slice(0, 60)
+    root.deviceName = root.plain(d.deviceName || "").slice(0, 120)
     root.transcoding = d.transcode === true
     root.transport = root.casting ? String(d.transport || "").slice(0, 32) : ""
     root.position = root.casting ? (Number(d.position) || 0) : 0
     root.duration = root.casting ? (Number(d.duration) || 0) : 0
+  }
+
+  // Fill only the placeholders a string has, so translations may drop some.
+  function fill(text, values) {
+    return String(text).replace(/%([1-9])/g, function(m, n) { return values[n - 1] !== undefined ? values[n - 1] : "" })
+  }
+  function tooltip() {
+    if (!engaged) return strings.t("tooltip.idle")
+    var key = casting ? (paused ? "tooltip.paused" : "tooltip.playing") : "tooltip.stopped"
+    return fill(strings.t(key), [title, deviceName, duration > 0 ? clock(position) + " / " + clock(duration) : ""])
   }
 
   function refresh() { if (!statusProcess.running) statusProcess.running = true }
@@ -123,32 +131,49 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    dimmed: !root.playing
-    text: root.stateGlyph + (root.bar && root.bar.vertical ? ""
+    // Idle: just the cast icon, like the neighbouring status icons.
+    dimmed: root.engaged && !root.playing
+    text: !root.engaged ? "󰄘" : root.stateGlyph + (root.bar && root.bar.vertical ? ""
       : "  " + root.shortTitle(root.title) + (root.count > 1 ? "  (" + (root.currentIndex + 1) + "/" + root.count + ")" : ""))
-    tooltipText: root.popupOpen ? "" : strings.t(root.casting ? (root.paused ? "tooltip.paused" : "tooltip.playing") : "tooltip.stopped")
-      .arg(root.title).arg(root.deviceName).arg(root.duration > 0 ? root.clock(root.position) + " / " + root.clock(root.duration) : "")
+    tooltipText: root.popupOpen ? "" : root.tooltip()
     onPressed: function(mouseButton) {
-      if (mouseButton === Qt.RightButton) root.run(["stop"])
-      else if (mouseButton === Qt.MiddleButton) root.run(["toggle"])
+      if (mouseButton === Qt.RightButton) { if (root.casting) root.run(["stop"]) }
+      else if (mouseButton === Qt.MiddleButton) { if (root.engaged) root.run(["toggle"]) }
       else { root.popupOpen = !root.popupOpen; if (root.popupOpen) root.refresh() }
     }
     onWheelMoved: function(delta) { if (root.casting) root.run(["seek", delta > 0 ? "+30" : "-30"]) }
   }
 
+  // Panel text follows the popup palette, as Omarchy's own popups do.
+  readonly property color pfg: Commons.Color.popups.text
+  readonly property color pdim: Qt.darker(Commons.Color.popups.text, 1.45)
+
   component PlainLabel: Text {
     textFormat: Text.PlainText
-    color: root.fg
-    font.family: root.fontFam
+    color: root.pfg
+    font.family: Style.font.family
     font.pixelSize: Style.font.body
     elide: Text.ElideRight
+    maximumLineCount: 1
   }
 
   component IconButton: Button {
-    foreground: root.fg
+    foreground: root.pfg
     horizontalPadding: Style.spacing.controlPaddingX
     verticalPadding: Style.spacing.controlPaddingY
     opacity: enabled ? 1.0 : 0.4
+  }
+
+  // A full-width menu row with a leading glyph: Omarchy's PopupMenuRow.
+  // The leading column every row shares: a glyph plus the gap before its
+  // label, measured so queue titles, the TV name and menu labels line up.
+  TextMetrics { id: glyphMetrics; font.family: Style.font.family; font.pixelSize: Style.font.body; text: "󰄘   " }
+  readonly property real glyphColumn: glyphMetrics.advanceWidth
+
+  component ActionRow: PopupMenuRow {
+    property string glyph: ""
+    property string label: ""
+    text: glyph + "   " + label
   }
 
   PopupCard {
@@ -157,40 +182,84 @@ BarWidget {
     bar: root.bar
     owner: root
     open: root.popupOpen
-    contentWidth: popup.fittedContentWidth(Style.space(380))
+    contentWidth: popup.fittedContentWidth(Style.space(360))
     contentHeight: popup.fittedContentHeight(column.implicitHeight)
 
     Column {
       id: column
       anchors.left: parent.left
       anchors.right: parent.right
-      spacing: Style.space(10)
+      spacing: Style.space(8)
 
-      // Now playing
-      Column {
+      // Header: the title, then the TV row.
+      PlainLabel {
         width: parent.width
-        spacing: Style.space(3)
+        text: root.engaged ? root.title : strings.t("panel.idleTitle")
+        font.pixelSize: Style.font.subtitle
+        font.bold: true
+      }
 
-        PlainLabel {
-          width: parent.width
-          text: root.title || strings.t("panel.empty")
-          font.pixelSize: Style.font.subtitle
-          font.bold: true
+      // TV row: icon and name on the left (elided first), state and the
+      // change-TV action on the right. Insets match the menu rows below.
+      Item {
+        id: deviceRow
+        width: parent.width
+        height: Math.max(deviceLabel.implicitHeight, changeTv.visible ? changeTv.implicitHeight : 0)
+
+        Text {
+          id: deviceGlyph
+          anchors.left: parent.left
+          anchors.leftMargin: Style.spacing.controlPaddingX
+          anchors.verticalCenter: parent.verticalCenter
+          width: root.glyphColumn
+          textFormat: Text.PlainText
+          text: "󰔂"
+          color: root.pdim
+          font.family: Style.font.family
+          font.pixelSize: Style.font.body
         }
         PlainLabel {
-          width: parent.width
-          color: Qt.darker(root.fg, 1.4)
+          id: deviceLabel
+          anchors.left: deviceGlyph.right
+          anchors.right: stateLabel.visible ? stateLabel.left : (changeTv.visible ? changeTv.left : parent.right)
+          anchors.rightMargin: Style.space(8)
+          anchors.verticalCenter: parent.verticalCenter
+          color: root.pdim
           font.pixelSize: Style.font.bodySmall
-          text: (root.casting ? (root.paused ? strings.t("panel.paused") : strings.t("panel.playing")) : strings.t("panel.stopped"))
-            .arg(root.deviceName).arg(root.currentIndex + 1).arg(root.count)
-            + (root.casting && root.transcoding ? "  ·  " + strings.t("panel.transcoding") : "")
+          text: root.deviceName !== "" ? root.deviceName : strings.t("panel.noDevice")
+        }
+        PlainLabel {
+          id: stateLabel
+          visible: text !== ""
+          anchors.right: changeTv.visible ? changeTv.left : parent.right
+          anchors.rightMargin: changeTv.visible ? Style.space(4) : Style.spacing.controlPaddingX
+          anchors.verticalCenter: parent.verticalCenter
+          elide: Text.ElideNone
+          color: root.pdim
+          font.pixelSize: Style.font.bodySmall
+          text: !root.engaged ? ""
+            : (root.casting ? [] : [strings.t("panel.stopped")])
+              .concat([strings.t("panel.position").arg(root.currentIndex + 1).arg(root.count)])
+              .concat(root.casting && root.transcoding ? [strings.t("panel.transcoding")] : []).join("  ·  ")
+        }
+        IconButton {
+          id: changeTv
+          visible: !root.casting
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          iconText: root.deviceName !== "" ? "󰑐" : "󰍉"
+          text: root.deviceName !== "" ? "" : strings.t("button.search")
+          fontSize: Style.font.bodySmall
+          iconSize: Style.font.body
+          tooltipText: root.deviceName !== "" ? strings.t("button.changeTv") : strings.t("button.searchTv")
+          onClicked: { root.popupOpen = false; root.run(["pick-device"]) }
         }
       }
 
       // Progress (drag to seek)
       Item {
         width: parent.width
-        height: Style.space(22)
+        height: Math.max(posLabel.implicitHeight, seekSlider.implicitHeight)
         visible: root.casting && root.duration > 0
 
         PlainLabel {
@@ -213,6 +282,9 @@ BarWidget {
           step: 1
           integer: true
           value: root.position
+          trackColor: Style.selectedFillFor(root.pfg, Commons.Color.accent)
+          fillColor: root.pfg
+          knobColor: root.pfg
           onReleased: function(v) { root.run(["seek", String(Math.round(v))]) }
         }
         PlainLabel {
@@ -226,8 +298,9 @@ BarWidget {
 
       // Transport controls; media controls keep their order in every language.
       Row {
+        visible: root.engaged
         anchors.horizontalCenter: parent.horizontalCenter
-        spacing: Style.space(4)
+        spacing: Style.space(2)
         LayoutMirroring.enabled: false
         LayoutMirroring.childrenInherit: true
 
@@ -238,7 +311,6 @@ BarWidget {
           tooltipText: root.playing ? strings.t("button.pause") : strings.t("button.play")
           iconSize: Style.font.iconLarge
           horizontalPadding: Style.spacing.panelGap
-          enabled: root.hasQueue || root.casting
           onClicked: root.run(["toggle"])
         }
         IconButton { iconText: "󰴆"; tooltipText: strings.t("button.forward30"); enabled: root.casting; onClicked: root.run(["seek", "+30"]) }
@@ -246,13 +318,13 @@ BarWidget {
         IconButton { iconText: "󰓛"; tooltipText: strings.t("button.stop"); enabled: root.casting; onClicked: root.run(["stop"]) }
       }
 
-      PanelSeparator { foreground: root.fg; visible: root.hasQueue }
+      PanelSeparator { foreground: root.pfg; visible: root.hasQueue }
 
       // Queue
       Flickable {
         id: queueView
         width: parent.width
-        height: Math.min(queueColumn.implicitHeight, Style.space(300))
+        height: Math.min(queueColumn.implicitHeight, Style.spacing.popupRowHeight * 8)
         contentHeight: queueColumn.implicitHeight
         clip: true
         boundsBehavior: Flickable.StopAtBounds
@@ -266,65 +338,68 @@ BarWidget {
           Repeater {
             model: root.items
 
-            BorderSurface {
+            Rectangle {
               id: row
               required property var modelData
               required property int index
               readonly property bool current: index === root.currentIndex
-              readonly property bool hot: rowMouse.containsMouse
+              readonly property bool hot: rowHover.hovered
 
               width: queueColumn.width
-              height: Math.max(rowLabel.implicitHeight, rowButtons.implicitHeight) + Style.space(6)
-              radius: Style.spacing.labelGap
-              color: current ? Style.selectedFillFor(root.fg, Commons.Color.accent)
-                : (hot ? Style.normalFillFor(root.fg, Commons.Color.accent) : "transparent")
-              borderSpec: current ? Border.controlSpec("normal", root.fg, Commons.Color.accent) : Border.none()
+              height: Style.spacing.popupRowHeight
+              radius: Style.cornerRadius
+              color: current ? Style.selectedFillFor(root.pfg, Commons.Color.accent)
+                : (hot ? Style.hoverFill : "transparent")
 
+              HoverHandler { id: rowHover }
               MouseArea {
-                id: rowMouse
                 anchors.fill: parent
-                hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: root.run(["play-index", String(row.index + 1)])
               }
 
               PlainLabel {
-                id: rowLabel
+                id: rowNumber
                 anchors.left: parent.left
-                anchors.right: rowButtons.left
-                anchors.leftMargin: Style.space(8)
+                anchors.leftMargin: Style.spacing.controlPaddingX
+                anchors.verticalCenter: parent.verticalCenter
+                width: root.glyphColumn
+                font.pixelSize: Style.font.bodySmall
+                color: row.current ? Commons.Color.accent : root.pdim
+                text: row.current && root.casting ? root.stateGlyph : String(row.index + 1)
+              }
+              PlainLabel {
+                anchors.left: rowNumber.right
+                anchors.right: rowButtons.visible ? rowButtons.left : parent.right
+                anchors.rightMargin: Style.spacing.controlPaddingX
                 anchors.verticalCenter: parent.verticalCenter
                 font.pixelSize: Style.font.bodySmall
                 font.bold: row.current
-                text: (row.current && root.casting ? root.stateGlyph + "  " : (row.index + 1) + ".  ")
-                  + row.modelData.title
+                text: row.modelData.title
               }
 
+              // Per-item actions appear on hover, so the list stays calm.
               Row {
                 id: rowButtons
                 anchors.right: parent.right
-                anchors.rightMargin: Style.space(2)
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: 0
-                opacity: row.hot || row.current || rowButtons.childHovered ? 1 : 0.35
-                property bool childHovered: false
-
+                visible: row.hot
                 IconButton {
-                  iconText: "󰁝"; tooltipText: strings.t("button.moveUp"); iconSize: Style.font.body
+                  iconText: "󰁝"; tooltipText: strings.t("button.moveUp"); iconSize: Style.font.bodySmall
+                  verticalPadding: 0
                   enabled: row.index > 0
                   onClicked: root.run(["move", String(row.index + 1), "up"])
-                  onHovered: function(h) { rowButtons.childHovered = h }
                 }
                 IconButton {
-                  iconText: "󰁅"; tooltipText: strings.t("button.moveDown"); iconSize: Style.font.body
+                  iconText: "󰁅"; tooltipText: strings.t("button.moveDown"); iconSize: Style.font.bodySmall
+                  verticalPadding: 0
                   enabled: row.index + 1 < root.count
                   onClicked: root.run(["move", String(row.index + 1), "down"])
-                  onHovered: function(h) { rowButtons.childHovered = h }
                 }
                 IconButton {
-                  iconText: "󰅖"; tooltipText: strings.t("button.remove"); iconSize: Style.font.body
+                  iconText: "󰅖"; tooltipText: strings.t("button.remove"); iconSize: Style.font.bodySmall
+                  verticalPadding: 0
                   onClicked: root.run(["remove", String(row.index + 1)])
-                  onHovered: function(h) { rowButtons.childHovered = h }
                 }
               }
             }
@@ -332,22 +407,28 @@ BarWidget {
         }
       }
 
-      Row {
-        anchors.right: parent.right
-        spacing: Style.space(6)
+      PanelSeparator { foreground: root.pfg }
 
-        Button {
-          text: strings.t("button.add")
-          iconText: "󰐕"
-          foreground: root.fg
-          onClicked: { root.popupOpen = false; root.run(["add"]) }
+      // Actions, as menu rows
+      Column {
+        width: parent.width
+        spacing: 0
+
+        ActionRow {
+          glyph: "󰄘"
+          label: root.engaged ? strings.t("action.castReplace") : strings.t("action.cast")
+          onTriggered: { root.popupOpen = false; root.run(["cast"]) }
         }
-        Button {
-          text: strings.t("button.clear")
-          iconText: "󰩺"
-          foreground: root.fg
+        ActionRow {
+          glyph: "󰐕"
+          label: strings.t("action.add")
+          onTriggered: { root.popupOpen = false; root.run(["add"]) }
+        }
+        ActionRow {
           visible: root.hasQueue
-          onClicked: root.run(["clear"])
+          glyph: "󰩺"
+          label: strings.t("action.clear")
+          onTriggered: root.run(["clear"])
         }
       }
     }

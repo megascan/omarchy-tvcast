@@ -16,6 +16,7 @@
 #   tvcast stop                      stop playback, keep the queue
 #   tvcast status [--json]           now playing (+ TV state and position)
 #   tvcast devices [--json]          discover TVs (takes a few seconds)
+#   tvcast pick-device               discover and choose the TV to cast to
 #   tvcast active | has-queue [min]  exit 0 while casting / while queued
 #
 # Playback runs as the transient user unit tvcast.service ("tvcast _run"),
@@ -492,6 +493,11 @@ cmd_add() { # append; starts playing only when nothing is queued or playing
   fi
 }
 
+cmd_pick_device() { # search the network and remember the chosen TV
+  ensure_device --pick || return 0
+  notify low "Cast to TV" "Casting to $(q_get '.device.name // "TV"') from now on."
+}
+
 cmd_next() {
   local i count
   i=$(q_index) count=$(q_count)
@@ -593,15 +599,16 @@ cmd_seek() {
 # list: queue plus now-playing, no network calls. status --json adds the TV's
 # transport state and position while casting.
 cmd_list() {
-  local active=false st
+  local active=false st last=""
+  [[ -s $DEVICE_FILE ]] && last=$(cut -f1 "$DEVICE_FILE")
   if is_active; then active=true; elif [[ $(state_get active) == true ]]; then write_state '{"active":false}'; fi
   st='{}'
   [[ $active == true && -s $STATE_FILE ]] && st=$(cat "$STATE_FILE")
-  q_read | jq -c --argjson active "$active" --argjson st "$st" '{
+  q_read | jq -c --argjson active "$active" --argjson st "$st" --arg last "$last" '{
     active: $active,
     index: (.index // 0),
     count: (.items | length),
-    deviceName: (.device.name // ""),
+    deviceName: (.device.name // $last),
     title: ($st.title // (.items[.index // 0].title // "")),
     kind: ($st.kind // ""),
     transcode: ($st.transcode // false),
@@ -635,6 +642,7 @@ case ${1:-cast} in
   cast) shift; cmd_cast "$@" ;;
   add) shift; cmd_add "$@" ;;
   devices) shift; cmd_devices "$@" ;;
+  pick-device) cmd_pick_device ;;
   next) cmd_next ;;
   prev | previous) cmd_prev ;;
   play-index) shift; cmd_play_index "$@" ;;
@@ -654,6 +662,6 @@ case ${1:-cast} in
   has-queue) (($(q_count) >= ${2:-1})) ;;
   _run) cmd_run ;;
   _cleanup) cmd_cleanup ;;
-  -h | --help | help) sed -n '3,25p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  -h | --help | help) sed -n '3,26p' "$SELF" | sed 's/^# \{0,1\}//' ;;
   *) echo "tvcast: unknown command '$1' (try tvcast help)" >&2; exit 2 ;;
 esac
