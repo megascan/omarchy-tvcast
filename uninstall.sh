@@ -11,12 +11,17 @@ systemctl --user stop tvcast.service 2>/dev/null
 state=${XDG_STATE_HOME:-$HOME/.local/state}/tvcast
 # Only the exact lines install.sh recorded as its own; nothing if --menu was never used.
 if [[ -f $menu && -f $state/menu-owned.json ]]; then
-  cp "$menu" "$(mktemp "$menu.bak.XXXXXX")"
-  python3 -I "$here/menu/menu-edit.py" uninstall "$menu" "$state/menu-owned.json"
+  if ! { bak=$(mktemp "$menu.bak.XXXXXX") && cp "$menu" "$bak" &&
+    python3 -I "$here/menu/menu-edit.py" uninstall "$menu" "$state/menu-owned.json"; }; then
+    echo "menu cleanup failed; kept $state/menu-owned.json so running this again can finish it" >&2
+    failed=1
+  fi
 fi
 rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/tvcast"
 # Keep plugin-backups/ (previous installs moved aside by install.sh).
-find "$state" -mindepth 1 -maxdepth 1 ! -name plugin-backups -exec rm -rf {} + 2>/dev/null
+find "$state" -mindepth 1 -maxdepth 1 ! -name plugin-backups ! -name menu-owned.json -exec rm -rf {} + 2>/dev/null
+[[ ${failed:-0} == 1 ]] || rm -f "$state/menu-owned.json"
 rmdir "$state" 2>/dev/null
 [[ -d $state/plugin-backups ]] && echo "kept earlier plugin backups in $state/plugin-backups"
 echo "done; if installed with omarchy plugin add, finish with: omarchy plugin remove $id"
+exit "${failed:-0}"

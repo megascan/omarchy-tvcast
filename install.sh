@@ -47,13 +47,18 @@ fi
 if [[ ${1:-} == --menu ]]; then
   mkdir -p "$(dirname "$menu")"
   [[ -s $menu ]] || printf '{\n}\n' >"$menu"
-  cp "$menu" "$(mktemp "$menu.bak.XXXXXX")"
+  bak=$(mktemp "$menu.bak.XXXXXX")
+  cp "$menu" "$bak"
   state=${XDG_STATE_HOME:-$HOME/.local/state}/tvcast
   (umask 077 && mkdir -p "$state")
-  python3 -I "$here/menu/menu-edit.py" install "$menu" "$here/menu/omarchy-menu.snippet.jsonc" "$state/menu-owned.json" &&
+  if python3 -I "$here/menu/menu-edit.py" install "$menu" "$here/menu/omarchy-menu.snippet.jsonc" "$state/menu-owned.json"; then
     echo "added menu entries (Trigger > Cast to TV); backup saved next to $menu"
+  else
+    menu_failed=1
+  fi
 fi
 
 command -v go2tv >/dev/null || [[ -x $HOME/.local/bin/go2tv ]] ||
   echo "warning: go2tv not found; put the go2tv binary in ~/.local/bin (see README)" >&2
 echo "add the widget to the bar with: omarchy bar put $id --section right"
+exit "${menu_failed:-0}"

@@ -147,7 +147,11 @@
   snippet). A user's own `trigger.cast` parent makes install add nothing; a user's own
   child key is kept and tvcast's skipped. Uninstall removes only recorded lines, and
   nothing if `--menu` was never run. Omarchy's JSONC parser only strips whole-line `//`
-  comments, so never mark ownership with trailing comments. Writes are atomic via
+  comments, so never mark ownership with trailing comments. Entries go into the object
+  Omarchy reads (`items` when it is an object, else the root; see `MenuModel.js`
+  `readMenuJsonc`), and every edit is re-parsed the same way before writing; any
+  mismatch leaves the menu unchanged and exits non-zero. A failed uninstall keeps the
+  ownership record so a rerun can finish. Writes are atomic via
   `mkstemp` beside the real (symlink-resolved) file.
 - **By design, documented in the README:** go2tv's media server is unauthenticated
   HTTP on the TV-facing address while a file plays. The README's first firewall rule
