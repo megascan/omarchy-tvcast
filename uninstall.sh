@@ -13,5 +13,10 @@ if [[ -f $menu ]] && grep -q '"trigger.cast' "$menu"; then
   sed -i '/"trigger\.cast/d; /^ *\/\/ tvcast/d' "$menu"
   echo "removed menu entries (backup saved)"
 fi
-rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/tvcast" "${XDG_STATE_HOME:-$HOME/.local/state}/tvcast"
+state=${XDG_STATE_HOME:-$HOME/.local/state}/tvcast
+rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/tvcast"
+# Keep plugin-backups/ (previous installs moved aside by install.sh).
+find "$state" -mindepth 1 -maxdepth 1 ! -name plugin-backups -exec rm -rf {} + 2>/dev/null
+rmdir "$state" 2>/dev/null
+[[ -d $state/plugin-backups ]] && echo "kept earlier plugin backups in $state/plugin-backups"
 echo "done; if installed with omarchy plugin add, finish with: omarchy plugin remove $id"

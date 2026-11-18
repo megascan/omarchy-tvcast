@@ -84,3 +84,9 @@
   it. Run `_run` with `TERM=xterm-256color` (the unit sets it; go2tv's Chromecast screen
   needs it). go2tv 2.x launches its own receiver app (`C2568A1A`), not Google's default one.
 
+- **`install.sh` never deletes an existing install.** It stages the copy first, moves the old
+  plugin dir (edits, `.git`) to `$XDG_STATE_HOME/tvcast/plugin-backups/`, then swaps.
+  `uninstall.sh` keeps those backups. (Reported by a marketplace reviewer on 0.3.0.)
+- **A fake HOME/XDG does not sandbox systemd.** `systemctl --user` talks to the real user
+  manager through `XDG_RUNTIME_DIR`. `uninstall.sh` and `tvcast stop/clear` will stop the
+  user's live cast. Put stub `systemctl`/`systemd-run` first on PATH before running them in tests.

@@ -15,9 +15,21 @@ mkdir -p "$HOME/.local/bin" "$plugins"
 target=$plugins/$id
 if [[ $(readlink -f "$target") != "$here" ]]; then
   # A development clone: copy it in (the plugin validator refuses symlinks).
-  rm -rf "$target"
-  mkdir -p "$target"
-  tar -C "$here" --exclude=.git -cf - . | tar -C "$target" -xf -
+  # Never delete an existing install: copy into a staging dir first, then move
+  # the old install (local edits, .git and all) to a backup, then swap.
+  stage=$(mktemp -d "$plugins/.$id.new.XXXXXX")
+  trap 'rm -rf "$stage"' EXIT
+  tar -C "$here" --exclude=.git -cf - . | tar -C "$stage" -xf -
+  [[ -s $stage/manifest.json ]] || { echo "copy failed; $target left untouched" >&2; exit 1; }
+  if [[ -e $target || -L $target ]]; then
+    backups=${XDG_STATE_HOME:-$HOME/.local/state}/tvcast/plugin-backups
+    mkdir -p "$backups"
+    backup=$backups/$id.$(date +%Y%m%d-%H%M%S)
+    mv "$target" "$backup"
+    echo "moved the previous install to $backup"
+  fi
+  mv "$stage" "$target"
+  trap - EXIT
   echo "copied plugin $id into $target"
 fi
 ln -sfn "$target/bin/tvcast" "$HOME/.local/bin/tvcast"
