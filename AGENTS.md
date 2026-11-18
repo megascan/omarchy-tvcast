@@ -163,3 +163,7 @@
 - **Policy for go2tv-internal behaviour:** report it upstream and raise `GO2TV_MIN` once
   go2tv fixes it. Don't reimplement go2tv inside tvcast, unless (as with discovery) a
   small listen-only replacement takes the tool out of the untrusted path entirely.
+- **Clean untrusted text before it enters any delimited record** (tab-separated lists, the
+  device cache, menu options), not after parsing it back: a tab or newline in a device name
+  can forge extra fields or rows. When parsing such a list, re-check every security-relevant
+  field against the trusted source (DLNA URLs must be in the vetted SSDP `locations` set).

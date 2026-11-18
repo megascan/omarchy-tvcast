@@ -443,7 +443,9 @@ discover() {
     (
       xml=$(fetch -fsS -m 3 "$loc" 2>/dev/null) || exit 0
       [[ -n $(xpath_str "//*[local-name()='service']/*[local-name()='serviceType'][contains(., 'AVTransport')]" <<<"$xml") ]] || exit 0
-      name=$(xpath_str "//*[local-name()='device']/*[local-name()='friendlyName']" <<<"$xml")
+      # Clean before the name enters the tab-separated list: a raw tab or
+      # newline in friendlyName could otherwise forge a second entry.
+      name=$(xpath_str "//*[local-name()='device']/*[local-name()='friendlyName']" <<<"$xml" | clean_text 120)
       printf '%s\t%s\tdlna\n' "$name" "$loc"
     ) >"$dir/dlna.$((++i))" &
   done <"$dir/locations"
@@ -453,6 +455,8 @@ discover() {
     head -n "$MAX_DEVICES" "$f"
   done | while IFS=$'\t' read -r name url tag; do
     lan_url "$url" || continue
+    # A DLNA entry must be one of the vetted SSDP locations (the replying host).
+    [[ $tag != dlna ]] || grep -qxF -- "$url" "$dir/locations" || continue
     # go2tv routes -t by port alone, so skip anything it would misroute
     # (Chromecast groups on other ports, a DLNA device on 8009).
     [[ $tag == "$(url_type "$url")" ]] || continue
