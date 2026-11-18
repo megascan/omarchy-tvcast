@@ -133,7 +133,7 @@ uint() {
 # ---------- UPnP ----------
 
 xpath_str() { # xpath_str <expr>, XML on stdin
-  xmllint --xpath "string($1)" - 2>/dev/null
+  xmllint --nonet --xpath "string($1)" - 2>/dev/null # --nonet: never fetch DTDs or entities
 }
 
 # Everything a device tells us (SSDP LOCATION, URLBase, controlURL) is
@@ -143,7 +143,8 @@ xpath_str() { # xpath_str <expr>, XML on stdin
 # Bodies are capped at MAX_BODY: --max-filesize stops declared sizes, and
 # fetch's head -c stops chunked replies, which carry no size up front.
 MAX_BODY=1048576
-CURL=(curl --proto '=http,https' --max-redirs 0 --max-filesize "$MAX_BODY")
+# -q: ignore ~/.curlrc; --noproxy: device requests never go through a proxy.
+CURL=(curl -q --noproxy '*' --proto '=http,https' --max-redirs 0 --max-filesize "$MAX_BODY")
 
 fetch() { "${CURL[@]}" "$@" | head -c "$MAX_BODY"; } # fetch <curl args...>
 
@@ -412,37 +413,54 @@ dev_control() {
 # ---------- discovery ----------
 
 # discover: prints "name<TAB>url<TAB>type" per device (dlna|chromecast).
-# go2tv -l scans until killed and needs a terminal, so it runs under script(1);
-# we stop a few seconds after the first device shows up, or after TVCAST_SCAN_SECONDS (default 20).
+# Discovery is tvcast's own, not `go2tv -l`: go2tv fetches every SSDP
+# LOCATION it hears before returning a list, and accepts any host, so a LAN
+# responder could make it send requests anywhere (reported by a marketplace
+# reviewer on 0.3.4; upstream: https://github.com/alexballas/go2tv/issues/188).
+# bin/tvcast-discover only listens: SSDP replies (no fetch)
+# and mDNS via avahi (no fetch). Every address is checked with lan_url, and a
+# LOCATION must be on the host that sent the reply, BEFORE anything is fetched.
+# The surviving descriptions are then fetched with the capped CURL, a few at
+# a time. TVCAST_SCAN_SECONDS sets how long to listen (default 4).
+DISCOVER_HELPER=${SELF%/*}/tvcast-discover
+MAX_DEVICES=32
 discover() {
-  require_go2tv
-  local out pid max=${TVCAST_SCAN_SECONDS:-20} waited=0 first=0
-  out=$(mktemp "$CACHE_DIR/scan.XXXXXX")
-  SHELL=/bin/bash TERM=xterm-256color setsid script -qfc "$(printf '%q -l' "$GO2TV")" "$out" </dev/null >/dev/null 2>&1 &
-  pid=$!
-  while ((waited < max * 2)); do
-    sleep 0.5
-    waited=$((waited + 1))
-    kill -0 "$pid" 2>/dev/null || break
-    if ((first == 0)) && grep -aq '\[http' "$out"; then
-      first=$waited
-    fi
-    ((first > 0 && waited - first >= 6)) && break
-  done
-  kill -TERM -- "-$pid" 2>/dev/null
-  wait "$pid" 2>/dev/null
-  sed -E 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/\x1b\][^\x1b]*\x1b\\//g; s/\x1b[=>]//g' "$out" | tr '\r\t' '\n ' |
-    sed -nE 's/^[^[:alnum:]]*(.*[^ ]) +(DLNA|Chromecast) +\[(http[^]]+)\].*$/\1\t\3\t\2/p' | sort -u |
-    while IFS=$'\t' read -r name url tag; do
-      lan_url "$url" || continue
-      name=$(clean_text 120 <<<"$name")
-      [[ -n $name ]] || name=TV
-      # go2tv routes -t by port alone, so skip anything it would misroute
-      # (Chromecast groups on other ports, a DLNA device on 8009).
-      [[ ${tag,,} == "$(url_type "$url")" ]] || continue
-      printf '%s\t%s\t%s\n' "$name" "$url" "${tag,,}"
-    done
-  rm -f "$out"
+  local secs=${TVCAST_SCAN_SECONDS:-4} dir src loc n=0 i=0 f name url
+  [[ $secs =~ ^[0-9]{1,2}$ ]] || secs=4
+  dir=$(mktemp -d "$CACHE_DIR/scan.XXXXXX")
+  python3 -I "$DISCOVER_HELPER" mdns "$secs" >"$dir/mdns" 2>/dev/null &
+  python3 -I "$DISCOVER_HELPER" ssdp "$secs" 2>/dev/null | sort -u |
+    while IFS=$'\t' read -r src loc; do
+      ((n++ < MAX_DEVICES * 2)) || break
+      lan_url "$loc" || continue
+      [[ $(url_type "$loc") == dlna ]] || continue
+      [[ $(url_host "$loc") == "$src" ]] || continue # LOCATION must be the replying host
+      printf '%s\n' "$loc"
+    done | sort -u | head -n "$MAX_DEVICES" >"$dir/locations"
+  while read -r loc; do
+    # At most four description fetches at once.
+    while (($(jobs -rp | wc -l) >= 4)); do wait -n; done
+    (
+      xml=$(fetch -fsS -m 3 "$loc" 2>/dev/null) || exit 0
+      [[ -n $(xpath_str "//*[local-name()='service']/*[local-name()='serviceType'][contains(., 'AVTransport')]" <<<"$xml") ]] || exit 0
+      name=$(xpath_str "//*[local-name()='device']/*[local-name()='friendlyName']" <<<"$xml")
+      printf '%s\t%s\tdlna\n' "$name" "$loc"
+    ) >"$dir/dlna.$((++i))" &
+  done <"$dir/locations"
+  wait
+  for f in "$dir"/dlna.* "$dir/mdns"; do
+    [[ -s $f ]] || continue
+    head -n "$MAX_DEVICES" "$f"
+  done | while IFS=$'\t' read -r name url tag; do
+    lan_url "$url" || continue
+    # go2tv routes -t by port alone, so skip anything it would misroute
+    # (Chromecast groups on other ports, a DLNA device on 8009).
+    [[ $tag == "$(url_type "$url")" ]] || continue
+    name=$(clean_text 120 <<<"$name")
+    [[ -n $name ]] || name=TV
+    printf '%s\t%s\t%s\n' "$name" "$url" "$tag"
+  done | sort -u -t $'\t' -k2,2
+  rm -rf "$dir"
 }
 
 cmd_devices() {
@@ -542,7 +560,7 @@ needs_transcode() {
   [[ $(media_kind "$f") == video ]] || return 1
   e=$(ext_of "$f")
   [[ $OK_CONTAINERS == *" $e "* ]] || return 0
-  streams=$(ffprobe -v error -show_entries stream=codec_type,codec_name -of csv=p=0 -- "$f" 2>/dev/null) || return 0
+  streams=$(ffprobe -v error -protocol_whitelist file -show_entries stream=codec_type,codec_name -of csv=p=0 -- "$f" 2>/dev/null) || return 0
   vcodec=$(awk -F, '$2 == "video" {print $1; exit}' <<<"$streams")
   [[ -n $vcodec && $OK_VCODECS == *" $vcodec "* ]] || return 0
   acodecs=$(awk -F, '$2 == "audio" {print $1}' <<<"$streams")

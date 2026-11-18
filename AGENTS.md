@@ -136,3 +136,30 @@
   (Play on a saved queue) skip the CLI commands that discover devices. When adding any check
   on an external binary or device, put it where the binary is executed or the request is
   sent, and test the resume path (saved queue + `tvcast play`) as well as a fresh cast.
+
+## Review round 0.4.0 (discovery)
+
+- **Never hand an external tool unvalidated network input, and audit what third-party
+  tools fetch on their own.** `go2tv -l` fetched every SSDP LOCATION (any IP, hostname,
+  loopback or internet host) before tvcast could filter its output. A reviewer reported
+  this on 0.3.4; it is tracked upstream as https://github.com/alexballas/go2tv/issues/188.
+  go2tv is now only ever given a device URL that already passed `lan_url`. Before
+  adding any tool call, read what that tool contacts by itself (descriptions, icons,
+  DTDs, playlists, proxies, rc files). That is why curl runs with `-q --noproxy '*'`,
+  xmllint with `--nonet`, and ffprobe with `-protocol_whitelist file`.
+- **Discovery is `bin/tvcast-discover` (python3 -I, listen-only) plus filtering in bash.**
+  SSDP: M-SEARCH from a UDP source port in 3339-3438 (the README's ufw rule). At most 64
+  replies of 2 KiB each. Each reply is printed as `source-ip<TAB>LOCATION`. `discover`
+  drops anything failing `lan_url`, `url_type == dlna`, or LOCATION host == reply source,
+  BEFORE any fetch. It then fetches at most 32 descriptions, 4 at a time, with `fetch`,
+  and keeps only those with an AVTransport service. mDNS: `avahi-browse -rtpk
+  _googlecast._tcp` (zeroconf fallback), IPv4 only, no fetch. A group on a port other
+  than 8009 is dropped by `url_type`.
+- **Test discovery with fakes:** `TVCAST_SSDP_TARGET=127.0.0.1:<port>` points the M-SEARCH
+  at a fake responder. Stub `avahi-browse` on PATH (the real one queries the LAN), and
+  wrap `curl` on PATH to log every call. Hostile LOCATIONs (8.8.8.8, 127.0.0.1 without
+  TVCAST_ALLOW_LOOPBACK, a hostname, octal, our own IP, another LAN host) must produce
+  zero curl calls and zero hits on fake servers.
+- **Policy for go2tv-internal behaviour:** report it upstream and raise `GO2TV_MIN` once
+  go2tv fixes it. Don't reimplement go2tv inside tvcast, unless (as with discovery) a
+  small listen-only replacement takes the tool out of the untrusted path entirely.

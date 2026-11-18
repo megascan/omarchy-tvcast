@@ -41,7 +41,8 @@ Cast protocol for a Chromecast.
   whatever control URL a device advertises; tvcast refuses them): put the `go2tv` binary on
   your `PATH` or in `~/.local/bin`, or install the AUR package `go2tv`.
 - `ffmpeg`/`ffprobe`, `jq`, `curl`, `libxml2` (`xmllint`), `file`, `iproute2` (`ip`),
-  `python` (menu edits) and `util-linux` (`script`, `setsid`, `flock`).
+  `python` (discovery and menu edits), `avahi` (`avahi-browse`, for finding
+  Chromecasts) and `util-linux` (`script`, `setsid`, `flock`).
   Omarchy ships all of these.
 - A **DLNA/UPnP media renderer**, which most smart TVs are (LG webOS, Samsung,
   Sony, Philips and so on), or a **Chromecast** / Google TV (see below).
@@ -79,7 +80,7 @@ Discovery replies can come from any device, so these stay LAN-wide. They carry
 no file contents:
 
 ```sh
-sudo ufw allow from <your-LAN>/24 to any port 3339:3438 proto udp   # go2tv discovery replies
+sudo ufw allow from <your-LAN>/24 to any port 3339:3438 proto udp   # tvcast's SSDP discovery replies
 sudo ufw allow from <your-LAN>/24 to any port 1900 proto udp        # SSDP
 sudo ufw allow from <your-LAN>/24 to any port 5353 proto udp        # mDNS (Chromecast)
 ```
@@ -107,7 +108,7 @@ next to it. It only adds or replaces lines that start with its own
 
 If the widget isn't on the bar yet: `omarchy bar put megascan.tvcast --section right`.
 
-The first cast looks for TVs on the network (10–20 s). The chosen TV is remembered,
+The first cast looks for TVs on the network (about 5 s). The chosen TV is remembered,
 and "Cast files to another TV…" (or `tvcast cast --pick`) searches again.
 
 ## Command line
@@ -129,6 +130,15 @@ State lives in `~/.local/state/tvcast/` (queue) and `~/.cache/tvcast/` (now
 playing, last TV, go2tv's `session.log`). Both directories and their files are
 owner-only (0700/0600). Nothing in them is ever executed.
 `TVCAST_TRANSCODE=always|never` overrides the transcode check.
+
+Discovery is tvcast's own (`bin/tvcast-discover`), not `go2tv -l`. go2tv's list
+mode fetches every SSDP `LOCATION` it hears before returning, to any host
+([go2tv#188](https://github.com/alexballas/go2tv/issues/188)). tvcast only
+listens: it sends an SSDP M-SEARCH from a port in 3339–3438, and asks avahi for
+`_googlecast._tcp`. It drops every `LOCATION` that is not a private LAN IP, is
+this machine, or is not on the host that sent the reply, before fetching
+anything. It then fetches the remaining descriptions itself, with the limits
+below. Chromecasts are found without any HTTP request.
 
 Network safety: tvcast only talks to TVs on private LAN IP addresses (10/8, 172.16/12,
 192.168/16, link-local, IPv6 ULA), written in plain dotted decimal (no hostnames,

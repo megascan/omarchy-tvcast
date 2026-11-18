@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Find TVs on the LAN without contacting any host (tvcast's discovery).
+
+    tvcast-discover ssdp [seconds]    prints "<reply-source-ip><TAB><LOCATION>"
+    tvcast-discover mdns [seconds]    prints "<name><TAB>http://<ip>:<port><TAB>chromecast"
+
+Nothing here makes an HTTP request. tvcast validates every address it prints
+(private LAN IP, not this machine, LOCATION on the replying host) and only
+then fetches the surviving device descriptions itself, with its capped curl.
+
+SSDP: an M-SEARCH for media renderers goes to 239.255.255.250:1900 from a
+source port in 3339-3438, the range the README's ufw rule admits replies on.
+Replies are capped in size and count. A reply whose LOCATION host is not the
+address the reply came from is dropped, so a responder can't point us at
+another machine.
+
+mDNS: _googlecast._tcp through avahi-browse (no fetch at all), or python
+zeroconf when avahi is missing. Only IPv4 records, like go2tv.
+
+The SSDP target can be moved for tests with TVCAST_SSDP_TARGET=<ip>:<port>.
+"""
+
+import ipaddress
+import os
+import re
+import select
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+MAX_REPLIES = 64
+MAX_DATAGRAM = 2048
+MAX_LOCATION = 512
+PORTS = range(3339, 3439)
+SEARCH_TARGETS = (
+    "urn:schemas-upnp-org:device:MediaRenderer:1",
+    "urn:schemas-upnp-org:service:AVTransport:1",
+)
+
+
+def clean(text, limit):
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", text)
+    return text[:limit]
+
+
+def ssdp(seconds):
+    target = os.environ.get("TVCAST_SSDP_TARGET", "239.255.255.250:1900")
+    host, _, port = target.rpartition(":")
+    dest = (host, int(port))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    for p in PORTS:
+        try:
+            sock.bind(("", p))
+            break
+        except OSError:
+            continue
+    else:
+        sys.exit("tvcast-discover: no free UDP port in 3339-3438")
+    for _ in range(2):
+        for st in SEARCH_TARGETS:
+            msg = (
+                "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+                f'MAN: "ssdp:discover"\r\nMX: 2\r\nST: {st}\r\n\r\n'
+            )
+            try:
+                sock.sendto(msg.encode(), dest)
+            except OSError:
+                pass
+        time.sleep(0.2)
+    seen = set()
+    replies = 0
+    deadline = time.monotonic() + seconds
+    while replies < MAX_REPLIES:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        ready, _, _ = select.select([sock], [], [], left)
+        if not ready:
+            break
+        data, (src, _) = sock.recvfrom(MAX_DATAGRAM)
+        replies += 1
+        text = data.decode("latin-1")
+        m = re.search(r"^location:[ \t]*(\S+)[ \t]*\r?$", text, re.I | re.M)
+        if not m or len(m.group(1)) > MAX_LOCATION:
+            continue
+        loc = clean(m.group(1), MAX_LOCATION)
+        if (src, loc) in seen:
+            continue
+        seen.add((src, loc))
+        print(f"{src}\t{loc}", flush=True)
+
+
+def unescape_avahi(text):
+    # avahi-browse -p writes special characters as \DDD (decimal).
+    return re.sub(r"\\(\d{3})", lambda m: chr(int(m.group(1))), text)
+
+
+def ipv4(text):
+    try:
+        return str(ipaddress.IPv4Address(text))
+    except ValueError:
+        return None
+
+
+def mdns_avahi(seconds, out):
+    try:
+        res = subprocess.run(
+            ["avahi-browse", "-rtpk", "_googlecast._tcp"],
+            capture_output=True, timeout=seconds + 2, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        stdout = getattr(e, "stdout", None) or b""
+    else:
+        stdout = res.stdout
+    for line in stdout[:262144].decode("utf-8", "replace").splitlines():
+        f = line.split(";", 9)
+        if len(f) < 10 or f[0] != "=" or f[2] != "IPv4":
+            continue
+        ip, port = ipv4(f[7]), f[8]
+        if not ip or not port.isdigit():
+            continue
+        txt = unescape_avahi(f[9])
+        m = re.search(r'"fn=([^"]*)"', txt)
+        name = m.group(1) if m else unescape_avahi(f[3])
+        out.add((clean(name, 120), f"http://{ip}:{int(port)}"))
+
+
+def mdns_zeroconf(seconds, out):
+    try:
+        from zeroconf import ServiceBrowser, Zeroconf  # noqa: PLC0415 (optional)
+    except ImportError:
+        return
+    zc = Zeroconf()
+    found = []
+
+    class Listener:
+        def add_service(self, zc_, type_, name):
+            found.append(name)
+
+        def update_service(self, *a):
+            pass
+
+        def remove_service(self, *a):
+            pass
+
+    ServiceBrowser(zc, "_googlecast._tcp.local.", Listener())
+    time.sleep(seconds)
+    for name in found[:MAX_REPLIES]:
+        info = zc.get_service_info("_googlecast._tcp.local.", name, timeout=1000)
+        if not info:
+            continue
+        fn = (info.properties or {}).get(b"fn", b"") or name.split(".")[0].encode()
+        for addr in info.parsed_addresses()[:4]:
+            ip = ipv4(addr)
+            if ip:
+                out.add((clean(fn.decode("utf-8", "replace"), 120), f"http://{ip}:{int(info.port)}"))
+    zc.close()
+
+
+def mdns(seconds):
+    out = set()
+    if shutil.which("avahi-browse"):
+        mdns_avahi(seconds, out)
+    else:
+        mdns_zeroconf(seconds, out)
+    for name, url in sorted(out)[:MAX_REPLIES]:
+        print(f"{name}\t{url}\tchromecast")
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] not in ("ssdp", "mdns"):
+        sys.exit("usage: tvcast-discover ssdp|mdns [seconds]")
+    seconds = float(argv[2]) if len(argv) > 2 and re.fullmatch(r"\d{1,2}", argv[2]) else 4.0
+    (ssdp if argv[1] == "ssdp" else mdns)(seconds)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
