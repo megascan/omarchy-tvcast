@@ -31,6 +31,15 @@ BarWidget {
   // reports it, or seekHold times out, so it doesn't snap back meanwhile.
   property int seekTarget: -1
   readonly property int shownPosition: seekTarget >= 0 ? seekTarget : position
+  // TV volume (0-100). The slider shows volumeTarget/muteTarget until the TV
+  // reports them, or volumeHold times out, so it never snaps back.
+  property bool volumeControl: false
+  property int volume: 0
+  property bool muted: false
+  property int volumeTarget: -1
+  property int muteTarget: -1
+  readonly property int shownVolume: volumeTarget >= 0 ? volumeTarget : volume
+  readonly property bool shownMuted: muteTarget >= 0 ? muteTarget === 1 : muted
   property int currentIndex: 0
   property var items: []
   property bool popupOpen: false
@@ -83,6 +92,23 @@ BarWidget {
     root.position = root.casting ? (Number(d.position) || 0) : 0
     root.duration = root.casting ? (Number(d.duration) || 0) : 0
     if (root.seekTarget >= 0 && (!root.casting || Math.abs(root.position - root.seekTarget) <= 3)) root.seekTarget = -1
+    root.volumeControl = root.casting && d.volumeControl === true
+    root.volume = root.volumeControl ? Math.max(0, Math.min(100, Number(d.volume) || 0)) : 0
+    root.muted = root.volumeControl && d.muted === true
+    if (root.volumeTarget >= 0 && !volumeSend.running && (!root.volumeControl || Math.abs(root.volume - root.volumeTarget) <= 1)) root.volumeTarget = -1
+    if (root.muteTarget >= 0 && (!root.volumeControl || (root.muteTarget === 1) === root.muted)) root.muteTarget = -1
+  }
+
+  // One SetVolume per pause in dragging or scrolling (150 ms), not per step.
+  function setVolume(v) {
+    root.volumeTarget = Math.max(0, Math.min(100, Math.round(v)))
+    volumeHold.restart()
+    volumeSend.restart()
+  }
+  function toggleMute() {
+    root.muteTarget = root.shownMuted ? 0 : 1
+    volumeHold.restart()
+    root.run(["mute", root.muteTarget === 1 ? "on" : "off"])
   }
 
   function seekTo(sec) {
@@ -144,6 +170,8 @@ BarWidget {
   Timer { id: seekHold; interval: 6000; onTriggered: root.seekTarget = -1 }
 
   Timer { id: refreshSoon; interval: 700; onTriggered: root.refresh() }
+  Timer { id: volumeSend; interval: 150; onTriggered: if (root.volumeTarget >= 0) root.run(["volume", root.volumeTarget]) }
+  Timer { id: volumeHold; interval: 5000; onTriggered: { root.volumeTarget = -1; root.muteTarget = -1 } }
 
   WidgetButton {
     id: button
@@ -342,6 +370,57 @@ BarWidget {
         IconButton { iconText: "󰴆"; tooltipText: strings.t("button.forward30"); enabled: root.canSeek; onClicked: root.run(["seek", "+30"]) }
         IconButton { iconText: "󰒭"; tooltipText: strings.t("button.next"); enabled: root.currentIndex + 1 < root.count; onClicked: root.run(["next"]) }
         IconButton { iconText: "󰓛"; tooltipText: strings.t("button.stop"); enabled: root.casting; onClicked: root.run(["stop"]) }
+      }
+
+      // Volume: the speaker toggles mute, the slider (and scrolling over it)
+      // sets the TV's volume. Greyed out when the TV offers no volume control.
+      Item {
+        id: volumeRow
+        width: parent.width
+        height: Math.max(muteButton.implicitHeight, volumeSlider.implicitHeight)
+        visible: root.casting
+        enabled: root.volumeControl
+        opacity: root.volumeControl ? 1 : 0.4
+
+        IconButton {
+          id: muteButton
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          opacity: 1
+          iconText: root.shownMuted ? "󰝟" : (root.shownVolume === 0 ? "󰕿" : (root.shownVolume < 50 ? "󰖀" : "󰕾"))
+          tooltipText: !root.volumeControl ? strings.t("panel.noVolume") : (root.shownMuted ? strings.t("button.unmute") : strings.t("button.mute"))
+          onClicked: root.toggleMute()
+        }
+        PanelSlider {
+          id: volumeSlider
+          bar: root.bar
+          // Same track span as the progress slider above.
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.leftMargin: Math.max(muteButton.width + Style.space(4), seekSlider.x)
+          anchors.rightMargin: Math.max(volLabel.implicitWidth + Style.space(8), progressRow.width - seekSlider.x - seekSlider.width)
+          anchors.verticalCenter: parent.verticalCenter
+          minimum: 0
+          maximum: 100
+          step: 5
+          integer: true
+          value: root.volumeControl ? root.shownVolume : 0
+          opacity: root.shownMuted ? 0.5 : 1
+          trackColor: Style.selectedFillFor(root.pfg, Commons.Color.accent)
+          fillColor: root.pfg
+          knobColor: root.pfg
+          onMoved: function(v) { root.setVolume(v) }
+          onReleased: function(v) { root.setVolume(v) }
+          onRightClicked: root.toggleMute()
+        }
+        PlainLabel {
+          id: volLabel
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          elide: Text.ElideNone
+          font.pixelSize: Style.font.caption
+          text: root.volumeControl ? String(root.shownVolume) : "–"
+        }
       }
 
       PanelSeparator { foreground: root.pfg; visible: root.hasQueue }

@@ -78,6 +78,17 @@
   PLAYING, Seek, Pause. Seeks are serialised by `seek.lock`. The bar's `canSeek` greys the
   slider, ±30 s and scroll out while the TV is loading or stopped. Fake TVs used for seek
   tests must hang on a paused Seek like the LG does.
+- **Volume goes through `dev_volume`, `dev_set_volume` and `dev_set_mute`.** DLNA uses
+  RenderingControl (Channel Master). Its controlURL and SCPDURL come from `service_url`
+  (the same origin pinning as AVTransport's `control_url`), every request goes through
+  `soap_call`, and the result is cached in `~/.cache/tvcast/rendering` per description URL
+  ("none" is retried after a minute, so the bar's polls don't refetch the description).
+  The cached URL is re-checked on every read. tvcast speaks 0-100 and scales to the SCPD's
+  Volume maximum. Test with a fake TV whose RenderingControl controlURL (absolute, octal,
+  or via URLBase) points elsewhere, plus a hand-edited cache: no request may leave.
+  The bar's volume slider is optimistic (`volumeTarget`/`muteTarget`) and sends one
+  `tvcast volume` per 150 ms pause in dragging or scrolling. Epoch seconds are 10 digits:
+  never pass them through `uint` (9 digits max), compare them in jq.
 - **Chromecast control is `bin/tvcast-chromecast` (python-pychromecast, optional).** Call it
   only through `cast_helper`, which enforces a LAN IP, `timeout`, `ulimit -v` (Cast frames
   declare their own length) and a 4 KiB output cap. The helper must never launch an app on

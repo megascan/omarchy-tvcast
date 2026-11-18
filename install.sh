@@ -54,7 +54,7 @@ path, snip = sys.argv[1], sys.argv[2]
 # Only our own lines: a line that starts with one of the snippet's keys, or
 # the snippet's comment. Anything else (a "trigger.castle" entry, a one-line
 # file) is left exactly as it is.
-ours = re.compile(r'^\s*("trigger\.cast(\.(file|add|other|play|toggle|next|prev|back|forward|status|stop|clear))?"\s*:|// tvcast: )')
+ours = re.compile(r'^\s*("trigger\.cast(\.(file|add|other|play|toggle|next|prev|back|forward|volup|voldown|mute|status|stop|clear))?"\s*:|// tvcast: )')
 text = "\n".join(l for l in open(path).read().split("\n") if not ours.match(l))
 end = text.rstrip().rfind("}")
 if end < 0:

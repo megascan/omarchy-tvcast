@@ -24,5 +24,8 @@
   "action.clear": "Clear queue",
   "button.search": "Search",
   "panel.stopped": "Stopped",
-  "panel.position": "%1 of %2"
+  "panel.position": "%1 of %2",
+  "button.mute": "Mute",
+  "button.unmute": "Unmute",
+  "panel.noVolume": "This TV offers no volume control"
 }

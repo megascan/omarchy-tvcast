@@ -2,9 +2,13 @@
 """Control a Chromecast that go2tv is casting to (optional tvcast backend).
 
     tvcast-chromecast --check                      exit 0 if pychromecast is installed
-    tvcast-chromecast <ip> <port> status           prints "<STATE> <pos-s> <dur-s>"
+    tvcast-chromecast <ip> <port> status           prints "<STATE> <pos-s> <dur-s> <vol> <muted>"
     tvcast-chromecast <ip> <port> pause|play|stop
     tvcast-chromecast <ip> <port> seek <seconds>
+    tvcast-chromecast <ip> <port> volume <0-100>
+    tvcast-chromecast <ip> <port> mute on|off
+
+<vol> is 0-100, or - when unknown; <muted> is 1 or 0.
 
 STATE uses the DLNA AVTransport words so tvcast treats both backends alike:
 PLAYING, PAUSED_PLAYBACK, TRANSITIONING, STOPPED or NO_MEDIA_PRESENT.
@@ -59,17 +63,21 @@ def main(argv):
     if argv[1:] == ["--check"]:
         return 0
     if len(argv) < 4:
-        fail("usage: tvcast-chromecast <ip> <port> status|pause|play|stop|seek <s>", 2)
+        fail("usage: tvcast-chromecast <ip> <port> status|pause|play|stop|seek <s>|volume <n>|mute on|off", 2)
     host, port, cmd, *rest = argv[1:]
     ip = lan_ip(host)
     if ip is None:
         fail(f"refusing non-LAN address {host!r}", 2)
     if not port.isdigit() or not 0 < int(port) < 65536:
         fail(f"bad port {port!r}", 2)
-    if cmd not in ("status", "pause", "play", "stop", "seek"):
+    if cmd not in ("status", "pause", "play", "stop", "seek", "volume", "mute"):
         fail(f"unknown command {cmd!r}", 2)
     if cmd == "seek" and (len(rest) != 1 or not rest[0].isdigit() or len(rest[0]) > 9):
         fail("seek needs whole seconds", 2)
+    if cmd == "volume" and (len(rest) != 1 or not rest[0].isdigit() or int(rest[0]) > 100):
+        fail("volume needs 0-100", 2)
+    if cmd == "mute" and rest not in (["on"], ["off"]):
+        fail("mute needs on or off", 2)
 
     from pychromecast.models import CastInfo, HostServiceInfo  # noqa: PLC0415
 
@@ -89,7 +97,7 @@ def main(argv):
         # another app runs would make pychromecast launch the media receiver.
         if status.app_id not in MEDIA_RECEIVERS and MEDIA_NS not in (status.namespaces or []):
             if cmd == "status":
-                print("NO_MEDIA_PRESENT 0 0")
+                print("NO_MEDIA_PRESENT 0 0 - 0")
                 return 0
             fail("nothing is casting on this Chromecast")
         mc = cast.media_controller
@@ -101,7 +109,16 @@ def main(argv):
                 state = "NO_MEDIA_PRESENT"
             pos = int(ms.adjusted_current_time or ms.current_time or 0)
             dur = int(ms.duration or 0)
-            print(f"{state} {max(pos, 0)} {max(dur, 0)}")
+            level = status.volume_level
+            vol = "-" if level is None else str(min(max(round(level * 100), 0), 100))
+            print(f"{state} {max(pos, 0)} {max(dur, 0)} {vol} {1 if status.volume_muted else 0}")
+            return 0
+        # Volume is the receiver's, set only while go2tv's session runs (checked above).
+        if cmd == "volume":
+            cast.set_volume(int(rest[0]) / 100, timeout=5)
+            return 0
+        if cmd == "mute":
+            cast.set_volume_muted(rest[0] == "on", timeout=5)
             return 0
         if ms.media_session_id is None:
             fail("nothing is casting on this Chromecast")

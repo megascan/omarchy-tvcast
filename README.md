@@ -2,9 +2,9 @@
 
 Cast local video, audio and image files to a DLNA smart TV or a Chromecast
 (experimental) from Omarchy, as a play queue you manage from the top bar. Files
-are served by [go2tv](https://github.com/alexballas/go2tv). Pause, seek, stop and
-the queue's auto-advance go straight to the TV over UPnP AVTransport, or over the
-Cast protocol for a Chromecast.
+are served by [go2tv](https://github.com/alexballas/go2tv). Pause, seek, stop,
+volume and the queue's auto-advance go straight to the TV over UPnP AVTransport and
+RenderingControl, or over the Cast protocol for a Chromecast.
 
 ![Queue panel](preview.png)
 
@@ -14,7 +14,9 @@ Cast protocol for a Chromecast.
   - Idle, it shows a cast icon. Click it for "Cast files…" and "Add to queue…", plus
     the TV to cast to, with a button to search again.
   - While casting, it shows `▶ Title (2/5)`. Click opens the queue panel: progress
-    (click or drag the bar to seek; greyed out when the TV reports no duration or is still loading the file), previous, −30 s, play/pause, +30 s, next and stop, the queue (hover
+    (click or drag the bar to seek; greyed out when the TV reports no duration or is still loading the file), previous, −30 s, play/pause, +30 s, next and stop, the TV's volume (the speaker
+    mutes; scroll over the slider to change it; greyed out when the TV offers no volume
+    control), the queue (hover
     an item to move or remove it, click to play it), and the file actions.
   - Middle-click pauses or resumes, right-click stops, and scrolling seeks 30 s.
 - **Queue:** moves to the next file when the TV reports the current one finished.
@@ -119,6 +121,7 @@ tvcast add [--pick] [file...]    append to the queue (starts it if it was empty)
 tvcast next | prev | play-index N | remove N | move N up|down | clear | list
 tvcast play | toggle | pause | resume | stop
 tvcast seek +30 | seek -30 | seek 1:02:03 | seek-to <seconds>
+tvcast volume [N|+N|-N|up|down] | mute [on|off|toggle]
 tvcast status [--json] | devices [--json] | pick-device
 ```
 

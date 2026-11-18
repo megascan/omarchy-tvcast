@@ -17,6 +17,8 @@
 #   tvcast seek <+N|-N|secs|hh:mm:ss>
 #   tvcast seek-to <secs>            jump to an absolute position (clamped)
 #   tvcast stop                      stop playback, keep the queue
+#   tvcast volume [N|+N|-N|up|down]  TV volume 0-100 (no argument: print it)
+#   tvcast mute [on|off|toggle]      mute the TV (default: toggle)
 #   tvcast status [--json]           now playing (+ TV state and position)
 #   tvcast devices [--json]          discover TVs and Chromecasts (a few seconds)
 #   tvcast pick-device               discover and choose the TV to cast to
@@ -44,6 +46,8 @@ QUEUE_FILE=$STATE_DIR/queue.json
 LOCK_FILE=$STATE_DIR/lock
 CC_STATUS_FILE=$CACHE_DIR/chromecast-status
 AVT=urn:schemas-upnp-org:service:AVTransport:1
+RCS=urn:schemas-upnp-org:service:RenderingControl:1
+RC_FILE=$CACHE_DIR/rendering
 CAST_HELPER=${TVCAST_CAST_HELPER:-${SELF%/*}/tvcast-chromecast}
 PYCHROMECAST_HINT="Chromecast pause, seek and progress need python-pychromecast (sudo pacman -S python-pychromecast)."
 
@@ -230,14 +234,16 @@ lan_url() {
   ! own_address "${host%\]}"
 }
 
-# control_url <device-description-url>: absolute AVTransport controlURL,
-# refused unless it is on the same origin as the description URL.
-control_url() {
-  local desc_url=$1 xml ctl base origin url
+# service_url <device-description-url> <service> <controlURL|SCPDURL> [xml]:
+# absolute URL of one of a service's endpoints, refused unless it is on the
+# same origin as the description URL. Pass the description to skip a fetch.
+service_url() {
+  local desc_url=$1 svc=$2 elem=$3 xml=${4:-} ctl base origin url
+  [[ $svc =~ ^[A-Za-z]+$ && $elem =~ ^(controlURL|SCPDURL)$ ]] || return 1
   lan_url "$desc_url" || return 1
   origin=$(url_origin "$desc_url") || return 1
-  xml=$(fetch -fsS -m 4 "$desc_url") || return 1
-  ctl=$(xpath_str "//*[local-name()='service'][*[local-name()='serviceType' and contains(., 'AVTransport')]]/*[local-name()='controlURL']" <<<"$xml")
+  [[ -n $xml ]] || xml=$(fetch -fsS -m 4 "$desc_url") || return 1
+  ctl=$(xpath_str "//*[local-name()='service'][*[local-name()='serviceType' and contains(., '$svc')]]/*[local-name()='$elem']" <<<"$xml")
   [[ -n $ctl ]] || return 1
   if [[ ${ctl,,} =~ ^[a-z][a-z0-9+.-]*: ]]; then
     url=$ctl
@@ -255,6 +261,8 @@ control_url() {
   }
   printf '%s\n' "$url"
 }
+
+control_url() { service_url "$1" AVTransport controlURL; } # control_url <desc-url>
 
 device_name() { # device_name <desc-url>
   lan_url "$1" || return 1
@@ -291,9 +299,11 @@ reachable() {
   fi
 }
 
-soap() { # soap <action> [inner-xml]; prints the response body
-  local action=$1 args=${2:-} ctl url
-  ctl=$(state_get control)
+soap() { soap_call "$(state_get control)" "$AVT" "$@"; } # soap <action> [inner-xml]
+
+# soap_call <control-url> <service-urn> <action> [inner-xml]: prints the body.
+soap_call() {
+  local ctl=$1 urn=$2 action=$3 args=${4:-} url
   [[ -n $ctl ]] || { echo "tvcast: nothing is casting" >&2; return 1; }
   # Re-check: state written by an older version may hold an unchecked URL.
   url=$(q_get '.device.url // empty' 2>/dev/null)
@@ -303,9 +313,9 @@ soap() { # soap <action> [inner-xml]; prints the response body
   fi
   fetch -fsS -m 5 -X POST "$ctl" \
     -H 'Content-Type: text/xml; charset="utf-8"' \
-    -H "SOAPACTION: \"$AVT#$action\"" \
+    -H "SOAPACTION: \"$urn#$action\"" \
     --data-binary "<?xml version=\"1.0\" encoding=\"utf-8\"?>
-<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:$action xmlns:u=\"$AVT\"><InstanceID>0</InstanceID>$args</u:$action></s:Body></s:Envelope>"
+<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:$action xmlns:u=\"$urn\"><InstanceID>0</InstanceID>$args</u:$action></s:Body></s:Envelope>"
 }
 
 hms_to_s() { # 1:02:03(.000) -> seconds
@@ -324,7 +334,7 @@ s_to_hms() { printf '%d:%02d:%02d\n' $(($1 / 3600)) $(($1 % 3600 / 60)) $(($1 % 
 
 cast_ready() { [[ -x $CAST_HELPER ]] && "$CAST_HELPER" --check >/dev/null 2>&1; }
 
-cast_helper() { # cast_helper <device-url> status|pause|play|stop|seek <s>; exit 3: no pychromecast
+cast_helper() { # cast_helper <device-url> status|pause|play|stop|seek <s>|volume <0-100>|mute on|off; exit 3: no pychromecast
   local url=$1 host port
   shift
   lan_url "$url" || return 1
@@ -336,9 +346,10 @@ cast_helper() { # cast_helper <device-url> status|pause|play|stop|seek <s>; exit
   ) 2>/dev/null | head -c 4096
 }
 
-# cc_status: "<STATE> <pos> <dur>" for the active Chromecast. The runner polls
-# the device and caches the answer, so the bar's status calls reuse it.
-cc_status() {
+# cc_line: the helper's raw status line "<STATE> <pos> <dur> <vol> <muted>"
+# for the active Chromecast. The runner polls the device and caches the
+# answer, so the bar's status calls reuse it.
+cc_line() {
   local ctl line="" age
   if [[ -z ${TVCAST_IN_RUNNER:-} && -s $CC_STATUS_FILE ]]; then
     age=$(($(date +%s) - $(stat -c %Y "$CC_STATUS_FILE" 2>/dev/null || echo 0)))
@@ -350,8 +361,12 @@ cc_status() {
     line=$(cast_helper "$ctl" status) || return 1
     [[ -n ${TVCAST_IN_RUNNER:-} ]] && printf '%s\n' "$line" >"$CC_STATUS_FILE"
   fi
-  local st pos dur
-  read -r st pos dur <<<"$line"
+  printf '%s\n' "$line"
+}
+
+cc_status() { # "<STATE> <pos> <dur>"
+  local st pos dur _
+  read -r st pos dur _ < <(cc_line) || return 1
   [[ $st =~ ^[A-Z_]{1,32}$ ]] || return 1
   printf '%s %s %s\n' "$st" "$(uint "$pos")" "$(uint "$dur")"
 }
@@ -460,6 +475,106 @@ dlna_seek() {
     sleep 1
     soap Pause >/dev/null || true
   fi
+}
+
+# ---------- volume ----------
+# DLNA volume is RenderingControl (Channel Master) on the same device. Its
+# controlURL and the Volume range from its SCPD are resolved with the same
+# origin pinning as AVTransport and cached in RC_FILE per description URL
+# ("none" is retried after a minute). tvcast always speaks 0-100 and scales
+# to the TV's own maximum.
+
+# rc_info: prints "<control-url> <max>" for the active DLNA device.
+rc_info() {
+  local desc ctl="" scpd max=100 xml cache now
+  desc=$(q_get '.device.url // empty')
+  [[ -n $desc ]] && lan_url "$desc" || return 1
+  now=$(date +%s)
+  if [[ -s $RC_FILE ]]; then
+    cache=$(jq -c --arg d "$desc" 'select(.device == $d)' "$RC_FILE" 2>/dev/null)
+    if [[ -n $cache ]]; then
+      ctl=$(jq -r '.control // empty' <<<"$cache")
+      max=$(uint "$(jq -r '.max // 0' <<<"$cache")")
+      if [[ -n $ctl ]]; then
+        [[ $(url_origin "$ctl") == "$(url_origin "$desc")" ]] && lan_url "$ctl" && ((max > 0)) || return 1
+        printf '%s %s\n' "$ctl" "$max"
+        return 0
+      fi
+      [[ $(jq -r --argjson now "$now" '((.checked // 0) | tonumber? // 0) + 60 > $now' <<<"$cache") == true ]] && return 1
+    fi
+  fi
+  xml=$(fetch -fsS -m 4 "$desc" 2>/dev/null) || xml=""
+  if [[ -n $xml ]] && ctl=$(service_url "$desc" RenderingControl controlURL "$xml" 2>/dev/null); then
+    max=100
+    if scpd=$(service_url "$desc" RenderingControl SCPDURL "$xml" 2>/dev/null); then
+      max=$(uint "$(fetch -fsS -m 4 "$scpd" 2>/dev/null |
+        xpath_str "//*[local-name()='stateVariable'][*[local-name()='name']='Volume']/*[local-name()='allowedValueRange']/*[local-name()='maximum']")")
+      ((max > 0 && max <= 65535)) || max=100
+    fi
+  else
+    ctl=""
+  fi
+  jq -cn --arg d "$desc" --arg c "$ctl" --argjson m "$max" --argjson t "$now" \
+    '{device: $d, control: $c, max: $m, checked: $t}' >"$RC_FILE"
+  [[ -n $ctl ]] || return 1
+  printf '%s %s\n' "$ctl" "$max"
+}
+
+rc_soap() { # rc_soap <control-url> <action> [inner-xml]
+  soap_call "$1" "$RCS" "$2" "<Channel>Master</Channel>${3:-}"
+}
+
+# dev_volume: prints "<0-100> <0|1 muted>"; fails if the device has no volume control.
+dev_volume() {
+  local vol muted ctl max raw m
+  if [[ $(active_type) == chromecast ]]; then
+    read -r _ _ _ vol muted < <(cc_line) || return 1
+    [[ $vol =~ ^[0-9]{1,3}$ ]] || return 1
+    vol=$(uint "$vol")
+    ((vol > 100)) && vol=100
+    [[ $muted == 1 ]] || muted=0
+    echo "$vol $muted"
+    return
+  fi
+  read -r ctl max < <(rc_info) || return 1
+  raw=$(rc_soap "$ctl" GetVolume | xpath_str "//*[local-name()='CurrentVolume']") || return 1
+  [[ $raw =~ ^[0-9]{1,5}$ ]] || return 1
+  raw=$(uint "$raw")
+  ((raw > max)) && raw=$max
+  m=$(rc_soap "$ctl" GetMute 2>/dev/null | xpath_str "//*[local-name()='CurrentMute']")
+  [[ ${m,,} == 1 || ${m,,} == true ]] && muted=1 || muted=0
+  echo "$(((raw * 100 + max / 2) / max)) $muted"
+}
+
+# dev_set_volume <0-100> [<current 0-100> <direction -1|0|1>]: on a TV with
+# fewer than 100 steps a small relative change still moves at least one step.
+dev_set_volume() {
+  local pct cur dir ctl max raw
+  pct=$(uint "$1") cur=$(uint "${2:-0}") dir=${3:-0}
+  ((pct > 100)) && pct=100
+  if [[ $(active_type) == chromecast ]]; then
+    dev_control volume "$pct"
+    return
+  fi
+  read -r ctl max < <(rc_info) || return 1
+  raw=$(((pct * max + 50) / 100))
+  if [[ $dir == 1 || $dir == -1 ]] && ((raw == (cur * max + 50) / 100)); then
+    raw=$((raw + dir))
+    ((raw < 0)) && raw=0
+    ((raw > max)) && raw=$max
+  fi
+  rc_soap "$ctl" SetVolume "<DesiredVolume>$raw</DesiredVolume>" >/dev/null
+}
+
+dev_set_mute() { # dev_set_mute 0|1
+  local ctl _ on=0
+  [[ $1 == 1 ]] && on=1
+  if [[ $(active_type) == chromecast ]]; then
+    if ((on)); then dev_control mute on; else dev_control mute off; fi
+    return
+  fi
+  read -r ctl _ < <(rc_info) || return 1
+  rc_soap "$ctl" SetMute "<DesiredMute>$on</DesiredMute>" >/dev/null
 }
 
 # ---------- discovery ----------
@@ -1070,7 +1185,7 @@ cmd_list() {
 }
 
 cmd_status() {
-  local json=${1:-} st="" pos=0 dur=0 list
+  local json=${1:-} st="" pos=0 dur=0 list vol=-1 muted=0
   list=$(cmd_list)
   if [[ $(jq -r .active <<<"$list") == true ]]; then
     if [[ $(active_type) == chromecast ]]; then
@@ -1079,10 +1194,14 @@ cmd_status() {
       st=$(transport_state 2>/dev/null)
       read -r pos dur < <(position_info 2>/dev/null) || true
     fi
+    [[ $json == --json ]] && { read -r vol muted < <(dev_volume 2>/dev/null) || vol=-1; }
   fi
   if [[ $json == --json ]]; then
+    vol=$( [[ $vol =~ ^[0-9]{1,3}$ ]] && uint "$vol" || echo -1)
     jq -c --arg st "$st" --argjson pos "${pos:-0}" --argjson dur "${dur:-0}" \
-      '. + {transport: $st, position: $pos, duration: $dur}' <<<"$list"
+      --argjson vol "$vol" --argjson muted "$( [[ ${muted:-0} == 1 ]] && echo true || echo false)" \
+      '. + {transport: $st, position: $pos, duration: $dur,
+            volumeControl: ($vol >= 0), volume: (if $vol >= 0 then $vol else null end), muted: $muted}' <<<"$list"
   elif [[ $(jq -r .active <<<"$list") == true ]]; then
     jq -r --arg st "${st:-UNKNOWN}" --arg p "$(s_to_hms "${pos:-0}")" --arg d "$(s_to_hms "${dur:-0}")" \
       '"\(.title) (\(.index + 1)/\(.count)) on \(.deviceName): \($st) \($p) / \($d)"' <<<"$list"
@@ -1091,6 +1210,39 @@ cmd_status() {
   else
     echo "Nothing is casting."
   fi
+}
+
+VOLUME_STEP=5
+cmd_volume() {
+  local arg=${1:-} vol muted target dir=0
+  is_active || die "Nothing is casting."
+  read -r vol muted < <(dev_volume) || die "This TV doesn't offer volume control."
+  case $arg in
+    "") if ((muted)); then echo "$vol (muted)"; else echo "$vol"; fi; return 0 ;;
+    up) target=$((vol + VOLUME_STEP)) dir=1 ;;
+    down) target=$((vol - VOLUME_STEP)) dir=-1 ;;
+    +[0-9] | +[0-9][0-9] | +[0-9][0-9][0-9]) target=$((vol + 10#${arg#+})) dir=1 ;;
+    -[0-9] | -[0-9][0-9] | -[0-9][0-9][0-9]) target=$((vol - 10#${arg#-})) dir=-1 ;;
+    [0-9] | [0-9][0-9] | [0-9][0-9][0-9]) target=$((10#$arg)) ;;
+    *) echo "usage: tvcast volume [N|+N|-N|up|down]" >&2; return 2 ;;
+  esac
+  ((target < 0)) && target=0
+  ((target > 100)) && target=100
+  dev_set_volume "$target" "$vol" "$dir" || die "The TV refused the volume change."
+}
+
+cmd_mute() {
+  local arg=${1:-toggle} muted on
+  is_active || die "Nothing is casting."
+  case $arg in
+    on) on=1 ;;
+    off) on=0 ;;
+    toggle)
+      read -r _ muted < <(dev_volume) || die "This TV doesn't offer volume control."
+      on=$((muted ? 0 : 1)) ;;
+    *) echo "usage: tvcast mute [on|off|toggle]" >&2; return 2 ;;
+  esac
+  dev_set_mute "$on" || die "This TV doesn't offer volume control."
 }
 
 cmd_notify_status() { notify low "Cast to TV" "$(cmd_status)"; }
@@ -1113,6 +1265,8 @@ case ${1:-cast} in
   resume) cmd_resume ;;
   seek) shift; cmd_seek "$@" ;;
   seek-to) shift; cmd_seek_to "$@" ;;
+  volume) shift; cmd_volume "$@" ;;
+  mute) shift; cmd_mute "$@" ;;
   stop) cmd_stop ;;
   status) shift; cmd_status "$@" ;;
   notify-status) cmd_notify_status ;;
@@ -1120,6 +1274,6 @@ case ${1:-cast} in
   has-queue) (($(q_count) >= $(uint "${2:-1}"))) ;;
   _run) cmd_run ;;
   _cleanup) cmd_cleanup ;;
-  -h | --help | help) sed -n '3,29p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  -h | --help | help) sed -n '3,31p' "$SELF" | sed 's/^# \{0,1\}//' ;;
   *) echo "tvcast: unknown command '$1' (try tvcast help)" >&2; exit 2 ;;
 esac
