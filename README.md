@@ -54,6 +54,19 @@ sudo ufw allow from <your-LAN>/24 to any port 1900 proto udp        # SSDP
 sudo ufw allow from <your-LAN>/24 to any port 5353 proto udp        # mDNS
 ```
 
+Tighter, if your TV has a fixed address (a DHCP reservation in your router):
+open the media server port to the TV alone.
+
+```sh
+sudo ufw allow from <TV-IP> to any port 3500:4499 proto tcp        # go2tv media server, TV only
+```
+
+Why: while a file is casting, go2tv serves it over plain HTTP with no password
+or token, so any device that can reach that port can fetch the file. Scoping
+the rule to the TV's IP keeps other machines on the network (guests, phones,
+smart plugs) from reading what you cast. The discovery rules can stay
+LAN-wide, since they carry no file contents.
+
 ## Install
 
 ```sh

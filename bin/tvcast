@@ -54,9 +54,20 @@ OK_ACODECS=" aac ac3 eac3 mp3 mp2 pcm_s16le pcm_s24le "
 
 mkdir -p "$CACHE_DIR" "$STATE_DIR"
 
+# markup_escape <text>: the notification daemon renders markup (links, bold), and
+# titles and TV names are untrusted, so &, < and > are always escaped.
+markup_escape() {
+  local s=$1
+  s=${s//&/\&amp;}
+  s=${s//</\&lt;}
+  s=${s//>/\&gt;}
+  printf '%s' "$s"
+}
+
 notify() { # notify <urgency> <headline> [body]; TVCAST_QUIET=1 prints instead
   [[ -n ${TVCAST_QUIET:-} ]] && { printf 'notify: %s: %s\n' "$2" "${3:-}" >&2; return; }
-  omarchy-notification-send -g "󰄘" -u "$1" "$2" "${3:-}" >/dev/null 2>&1 || printf '%s: %s\n' "$2" "${3:-}" >&2
+  omarchy-notification-send -g "󰄘" -u "$1" "$(markup_escape "$2")" "$(markup_escape "${3:-}")" >/dev/null 2>&1 ||
+    printf '%s: %s\n' "$2" "${3:-}" >&2
 }
 
 die() {
@@ -74,6 +85,14 @@ write_state() { # write_state <json>; written in place so the bar's file watch f
 
 state_get() { jq -r --arg k "$1" '.[$k] // empty' "$STATE_FILE" 2>/dev/null; }
 
+# uint <value>: prints the value if it is a plain non-negative integer, else 0.
+# Anything read from the queue, the state file or a device goes through this
+# before bash arithmetic: $(( )), (( )), [[ -gt ]] and array subscripts all
+# evaluate "a[$(cmd)]" and would run cmd.
+uint() {
+  if [[ ${1:-} =~ ^[0-9]{1,9}$ ]]; then printf '%d\n' "$((10#$1))"; else echo 0; fi
+}
+
 # ---------- UPnP ----------
 
 xpath_str() { # xpath_str <expr>, XML on stdin
@@ -84,7 +103,12 @@ xpath_str() { # xpath_str <expr>, XML on stdin
 # untrusted, so every request goes only to plain http(s) on a private LAN
 # address, never follows redirects, and control requests stay on the exact
 # origin (scheme, host, port) that served the device description.
-CURL=(curl --proto '=http,https' --max-redirs 0)
+# Bodies are capped at MAX_BODY: --max-filesize stops declared sizes, and
+# fetch's head -c stops chunked replies, which carry no size up front.
+MAX_BODY=1048576
+CURL=(curl --proto '=http,https' --max-redirs 0 --max-filesize "$MAX_BODY")
+
+fetch() { "${CURL[@]}" "$@" | head -c "$MAX_BODY"; } # fetch <curl args...>
 
 # url_origin <url>: prints scheme://host:port (lowercase), fails if malformed.
 # Hostnames are rejected on purpose (DNS rebinding); TVs announce IP addresses.
@@ -122,7 +146,7 @@ control_url() {
   local desc_url=$1 xml ctl base origin url
   lan_url "$desc_url" || return 1
   origin=$(url_origin "$desc_url") || return 1
-  xml=$("${CURL[@]}" -fsS -m 4 "$desc_url") || return 1
+  xml=$(fetch -fsS -m 4 "$desc_url") || return 1
   ctl=$(xpath_str "//*[local-name()='service'][*[local-name()='serviceType' and contains(., 'AVTransport')]]/*[local-name()='controlURL']" <<<"$xml")
   [[ -n $ctl ]] || return 1
   if [[ ${ctl,,} =~ ^[a-z][a-z0-9+.-]*: ]]; then
@@ -144,7 +168,7 @@ control_url() {
 
 device_name() { # device_name <desc-url>
   lan_url "$1" || return 1
-  "${CURL[@]}" -fsS -m 3 "$1" 2>/dev/null | xpath_str "//*[local-name()='device']/*[local-name()='friendlyName']"
+  fetch -fsS -m 3 "$1" 2>/dev/null | xpath_str "//*[local-name()='device']/*[local-name()='friendlyName']"
 }
 
 # reachable <url>: true if a LAN URL answers.
@@ -160,7 +184,7 @@ soap() { # soap <action> [inner-xml]; prints the response body
     echo "tvcast: refusing control URL outside the TV's own address: $ctl" >&2
     return 1
   fi
-  "${CURL[@]}" -fsS -m 5 -X POST "$ctl" \
+  fetch -fsS -m 5 -X POST "$ctl" \
     -H 'Content-Type: text/xml; charset="utf-8"' \
     -H "SOAPACTION: \"$AVT#$action\"" \
     --data-binary "<?xml version=\"1.0\" encoding=\"utf-8\"?>
@@ -169,7 +193,7 @@ soap() { # soap <action> [inner-xml]; prints the response body
 
 hms_to_s() { # 1:02:03(.000) -> seconds
   local t=${1%%.*} h m s
-  [[ $t =~ ^([0-9]+):([0-9]{1,2}):([0-9]{1,2})$ ]] || { echo 0; return; }
+  [[ $t =~ ^([0-9]{1,6}):([0-9]{1,2}):([0-9]{1,2})$ ]] || { echo 0; return; }
   h=${BASH_REMATCH[1]} m=${BASH_REMATCH[2]} s=${BASH_REMATCH[3]}
   echo $((10#$h * 3600 + 10#$m * 60 + 10#$s))
 }
@@ -192,7 +216,7 @@ position_info() { # prints "<pos-seconds> <duration-seconds>"
 discover() {
   local out pid max=${TVCAST_SCAN_SECONDS:-20} waited=0 first=0
   out=$(mktemp "$CACHE_DIR/scan.XXXXXX")
-  TERM=xterm-256color setsid script -qfc "$(printf '%q -l' "$GO2TV")" "$out" </dev/null >/dev/null 2>&1 &
+  SHELL=/bin/bash TERM=xterm-256color setsid script -qfc "$(printf '%q -l' "$GO2TV")" "$out" </dev/null >/dev/null 2>&1 &
   pid=$!
   while ((waited < max * 2)); do
     sleep 0.5
@@ -222,33 +246,56 @@ cmd_devices() {
   [[ -n $list ]]
 }
 
+# url_host <url>: the IP address part of a URL, for showing in menus.
+url_host() {
+  local o
+  o=$(url_origin "$1") || return 1
+  o=${o#*://}
+  printf '%s\n' "${o%:*}"
+}
+
 # choose_device [--pick]: prints "name<TAB>url". Reuses the cached TV when it
-# answers, unless --pick. Shows a menu only when more than one TV is found.
+# answers, unless --pick. A newly discovered device is never trusted on its
+# own: without --pick, discovery only auto-selects a device at the exact
+# description URL we already know; anything else (a single new device included)
+# goes through the menu, which shows each device's IP address.
 choose_device() {
-  local pick=${1:-} cached name url list count choice
-  if [[ -z $pick && -s $DEVICE_FILE ]]; then
+  local pick=${1:-} cached="" known="" name url list choice label
+  if [[ -s $DEVICE_FILE ]]; then
     cached=$(<"$DEVICE_FILE")
-    url=${cached#*$'\t'}
-    if reachable "$url"; then
-      printf '%s\n' "$cached"
-      return
-    fi
+    known=${cached#*$'\t'}
+  fi
+  [[ -n $known ]] || known=$(q_get '.device.url // empty')
+  if [[ -z $pick && -n $cached ]] && reachable "$known"; then
+    printf '%s\n' "$cached"
+    return
   fi
 
   notify low "Cast to TV" "Looking for TVs on the network…"
   list=$(discover)
-  count=$(grep -c . <<<"$list")
-  ((count > 0)) || return 1
+  [[ -n $list ]] || return 1
 
-  if ((count == 1)); then
-    choice=$list
-  else
-    local options=() selected=()
+  choice=""
+  if [[ -z $pick && -n $known ]]; then
     while IFS=$'\t' read -r name url; do
-      options+=("󰔂"$'\t'"$name"$'\t'"$url")
+      [[ $url == "$known" ]] && { choice=$name$'\t'$url; break; }
     done <<<"$list"
-    [[ -s $DEVICE_FILE ]] && selected=(--selected "$(<"$DEVICE_FILE")")
-    choice=$(omarchy-menu-select "Cast to" "${options[@]}" -- "${selected[@]}") || return 2
+  fi
+
+  if [[ -z $choice ]]; then
+    local options=() selected=() picked
+    while IFS=$'\t' read -r name url; do
+      label="$name  ($(url_host "$url"))"
+      options+=("󰔂"$'\t'"$label"$'\t'"$url")
+      [[ $url == "$known" ]] && selected=(--selected "$label"$'\t'"$url")
+    done <<<"$list"
+    picked=$(omarchy-menu-select "Cast to" "${options[@]}" -- "${selected[@]}") || return 2
+    [[ -n $picked ]] || return 2
+    # The menu returns "label<TAB>url"; map the URL back to the device's name.
+    url=${picked##*$'\t'}
+    while IFS=$'\t' read -r name label; do
+      [[ $label == "$url" ]] && { choice=$name$'\t'$label; break; }
+    done <<<"$list"
     [[ -n $choice ]] || return 2
   fi
   printf '%s\n' "$choice" >"$DEVICE_FILE"
@@ -309,8 +356,18 @@ subtitle_for() {
 #              "device": {"name","url","control"} | null}
 # Written in place under flock so the bar's file watch keeps working.
 
+# q_read prints the queue normalised: items is always an array and index a
+# small non-negative integer, so a hand-edited or hostile file can't smuggle
+# strings into arithmetic. Unreadable JSON reads as an empty queue.
 q_read() {
-  if [[ -s $QUEUE_FILE ]]; then cat "$QUEUE_FILE"; else echo '{"items":[],"index":0,"device":null}'; fi
+  local q=""
+  [[ -s $QUEUE_FILE ]] && q=$(jq -c '
+    (if type == "object" then . else {} end)
+    | .items = (if (.items | type) == "array" then .items else [] end)
+    | .index = ((.index // 0) | (tonumber? // 0) | floor
+                | if . >= 0 and . < 1000000000 then . else 0 end)
+    | .device = (if (.device | type) == "object" then .device else null end)' "$QUEUE_FILE" 2>/dev/null)
+  if [[ -n $q ]]; then printf '%s\n' "$q"; else echo '{"items":[],"index":0,"device":null}'; fi
 }
 
 q_get() { q_read | jq -r "$@"; } # q_get [jq args] <filter>
@@ -324,8 +381,8 @@ q_update() { # q_update [jq args...] <filter>
   ) 9>"$LOCK_FILE"
 }
 
-q_count() { q_get '.items | length'; }
-q_index() { q_get '.index // 0'; }
+q_count() { uint "$(q_get '.items | length')"; }
+q_index() { uint "$(q_get '.index')"; }
 
 items_json() { # items_json <file...>: JSON array of queue items, skipping non-files
   local f
@@ -439,14 +496,14 @@ cmd_run() {
   local q count idx item file title kind subs tc args name url ctl last
   while :; do
     q=$(q_read)
-    count=$(jq '.items | length' <<<"$q")
-    idx=$(jq '.index // 0' <<<"$q")
+    count=$(uint "$(jq '.items | length' <<<"$q")")
+    idx=$(uint "$(jq '.index' <<<"$q")")
     if ((idx >= count)); then
       ((count > 0)) && notify low "Cast to TV" "Queue finished."
       q_update '.items = [] | .index = 0'
       exit 0
     fi
-    item=$(jq -c ".items[$idx]" <<<"$q")
+    item=$(jq -c --argjson i "$idx" '.items[$i]' <<<"$q")
     file=$(jq -r .file <<<"$item")
     title=$(jq -r .title <<<"$item")
     kind=$(jq -r .kind <<<"$item")
@@ -482,7 +539,7 @@ cmd_run() {
       notify low "Casting to $name" "$title"
     fi
 
-    setsid script -qfec "$(printf '%q ' "$GO2TV" "${args[@]}")" "$LOG_FILE" </dev/null >/dev/null 2>&1 &
+    SHELL=/bin/bash setsid script -qfec "$(printf '%q ' "$GO2TV" "${args[@]}")" "$LOG_FILE" </dev/null >/dev/null 2>&1 &
     PLAYER_PID=$!
 
     if ! wait_item_end "$kind" "$last"; then
@@ -593,7 +650,7 @@ cmd_remove() { # 1-based
 
 cmd_move() { # move <N> up|down (1-based)
   [[ ${1:-} =~ ^[0-9]+$ && ${2:-} =~ ^(up|down)$ ]] || { echo "usage: tvcast move <N> up|down" >&2; return 2; }
-  local a=$(($1 - 1)) b count
+  local a=$((10#$1 - 1)) b count
   count=$(q_count)
   if [[ $2 == up ]]; then b=$((a - 1)); else b=$((a + 1)); fi
   ((a >= 0 && a < count && b >= 0 && b < count)) || return 0
@@ -697,7 +754,7 @@ cmd_status() {
   elif [[ $(jq -r .active <<<"$list") == true ]]; then
     jq -r --arg st "${st:-UNKNOWN}" --arg p "$(s_to_hms "${pos:-0}")" --arg d "$(s_to_hms "${dur:-0}")" \
       '"\(.title) (\(.index + 1)/\(.count)) on \(.deviceName): \($st) \($p) / \($d)"' <<<"$list"
-  elif [[ $(jq -r .count <<<"$list") -gt 0 ]]; then
+  elif (($(uint "$(jq -r .count <<<"$list")") > 0)); then
     jq -r '"Stopped. \(.count) in the queue, next: \(.title)"' <<<"$list"
   else
     echo "Nothing is casting."
@@ -728,7 +785,7 @@ case ${1:-cast} in
   status) shift; cmd_status "$@" ;;
   notify-status) cmd_notify_status ;;
   active) is_active ;;
-  has-queue) (($(q_count) >= ${2:-1})) ;;
+  has-queue) (($(q_count) >= $(uint "${2:-1}"))) ;;
   _run) cmd_run ;;
   _cleanup) cmd_cleanup ;;
   -h | --help | help) sed -n '3,26p' "$SELF" | sed 's/^# \{0,1\}//' ;;

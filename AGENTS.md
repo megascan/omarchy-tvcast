@@ -41,3 +41,21 @@
   origin (`url_origin`). Otherwise a rogue LAN device can aim our requests at localhost
   services or the internet (reported by a marketplace reviewer on 0.2.2).
   Test with a fake description that points controlURL/URLBase elsewhere: it must be refused.
+- **Never auto-trust a newly discovered device.** Discovery may auto-select only a device
+  at the exact description URL we already used. Any other device, even when it is the only
+  one found, goes through the picker, which shows its IP next to the name. Otherwise a rogue
+  LAN device that answers while the TV is off receives the file and becomes the default.
+- **Values from the queue, state file or a device never reach bash arithmetic unvalidated.**
+  `$(( ))`, `(( ))`, `[[ -gt ]]` and array subscripts evaluate `a[$(cmd)]` and run `cmd`.
+  Pass numbers through `uint` (and `q_read`, which normalises the queue) first, and give
+  jq indices with `--argjson`, never by splicing them into the filter.
+  Test with `"index":"PATH[$(touch /tmp/x)]"` in queue.json and run next/prev/status/list/move.
+- **Cap everything read from a device.** All requests go through `fetch` (CURL with
+  `--max-filesize`, piped through `head -c $MAX_BODY`, since chunked replies declare no size).
+- **Notification text is markup.** `notify` escapes `&`, `<` and `>` in the headline and
+  body, so titles and TV names can't inject links. Don't call `omarchy-notification-send` directly.
+- **`script -c` runs its command with `$SHELL`.** Always run it with `SHELL=/bin/bash`.
+- **Test only against fakes in a sandbox.** Export temporary `XDG_CACHE_HOME`, `XDG_STATE_HOME`
+  (and `HOME`) in the same shell before running any `tvcast` command, including `_run`.
+  A real cast may be running, and its queue lives in the default dirs (a test run once
+  cleared the user's live queue because the exports were missing from that shell).
