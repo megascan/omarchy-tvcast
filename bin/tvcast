@@ -92,10 +92,13 @@ notify() { # notify <urgency> <headline> [body]; TVCAST_QUIET=1 prints instead
 
 # clean_text <max>: drop control characters (escape sequences, tabs, newlines)
 # from untrusted text on stdin and cap its length.
-# C0 and DEL go byte-wise; C1 controls (U+0080-U+009F, e.g. the 8-bit CSI) too.
+# C0 and DEL go byte-wise; C1 controls (U+0080-U+009F, e.g. the 8-bit CSI) too,
+# and invisible or bidi-reordering characters (U+200B-U+200F, U+202A-U+202E,
+# U+2066-U+2069, U+FEFF) that would disguise a name.
 clean_text() {
   local s
-  s=$(LC_ALL=C tr -d '\000-\037\177' | LC_ALL=C sed 's/\xc2[\x80-\x9f]//g')
+  s=$(LC_ALL=C tr -d '\000-\037\177' |
+    LC_ALL=C sed 's/\xc2[\x80-\x9f]//g; s/\xe2\x80[\x8b-\x8f\xaa-\xae]//g; s/\xe2\x81[\xa6-\xa9]//g; s/\xef\xbb\xbf//g')
   printf '%s\n' "${s:0:$1}"
 }
 
@@ -164,7 +167,8 @@ xpath_str() { # xpath_str <expr>, XML on stdin
 # fetch's head -c stops chunked replies, which carry no size up front.
 MAX_BODY=1048576
 # -q: ignore ~/.curlrc; --noproxy: device requests never go through a proxy.
-CURL=(curl -q --noproxy '*' --proto '=http,https' --max-redirs 0 --max-filesize "$MAX_BODY")
+# -g: brackets and braces in a device URL are literal, never a curl URL range.
+CURL=(curl -q -g --noproxy '*' --proto '=http,https' --max-redirs 0 --max-filesize "$MAX_BODY")
 
 fetch() { "${CURL[@]}" "$@" | head -c "$MAX_BODY"; } # fetch <curl args...>
 
@@ -176,7 +180,7 @@ fetch() { "${CURL[@]}" "$@" | head -c "$MAX_BODY"; } # fetch <curl args...>
 OCTET='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
 url_origin() {
   local u=${1,,} scheme host port
-  [[ $u =~ ^(https?)://($OCTET\.$OCTET\.$OCTET\.$OCTET|\[[0-9a-f:]+\])(:([1-9][0-9]{0,4}))?(/|$) ]] || return 1
+  [[ $u =~ ^(https?)://($OCTET\.$OCTET\.$OCTET\.$OCTET|\[[0-9a-f:]+\])(:([1-9][0-9]{0,4}))?(/[[:graph:]]*)?$ ]] || return 1
   scheme=${BASH_REMATCH[1]} host=${BASH_REMATCH[2]} port=${BASH_REMATCH[8]}
   [[ -n $port ]] || { [[ $scheme == https ]] && port=443 || port=80; }
   ((port <= 65535)) || return 1
@@ -303,16 +307,57 @@ url_hostport() {
   printf '%s %s\n' "${host%\]}" "${o##*:}"
 }
 
-# reachable <url>: true if a LAN URL answers (a Chromecast: its TLS port accepts).
-reachable() {
-  lan_url "$1" || return 1
-  if [[ $(url_type "$1") == chromecast ]]; then
-    local host port
-    read -r host port < <(url_hostport "$1") || return 1
-    timeout 2 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null
-  else
-    "${CURL[@]}" -fsS -m 2 -o /dev/null "$1" 2>/dev/null
+# Receiver identity. An address alone doesn't name a TV: DHCP can hand it to
+# another device that answers at the same endpoint. So a chosen device is
+# saved with the ID it announces (DLNA: the root device's UDN; Chromecast: the
+# mDNS TXT id), and it is reused only while the device at that address still
+# reports the same ID. The ID is self-announced: this catches a reassigned
+# address, not a device that copies another's ID.
+DEV_ID_RE='^[A-Za-z0-9:._-]{1,128}$'
+
+dlna_udn() { # dlna_udn: the root device's UDN from the description XML on stdin
+  local id
+  id=$(xpath_str "/*[local-name()='root']/*[local-name()='device']/*[local-name()='UDN']" | clean_text 200)
+  id=${id//[[:space:]]/}
+  [[ $id =~ $DEV_ID_RE ]] && printf '%s\n' "$id"
+}
+
+# device_id <url>: prints the ID the device at that address announces now.
+# Exit 1: no answer; exit 2: it answered without a usable (or a unique) ID.
+device_id() {
+  local url=$1 xml ids
+  lan_url "$url" || return 1
+  if [[ $(url_type "$url") == chromecast ]]; then
+    ids=$(python3 -I "$DISCOVER_HELPER" mdns 2 2>/dev/null |
+      awk -F'\t' -v u="$url" '$2 == u && $4 != "" {print $4}' | sort -u)
+    [[ -n $ids ]] || return 1
+    [[ $ids != *$'\n'* && $ids =~ $DEV_ID_RE ]] || return 2
+    printf '%s\n' "$ids"
+    return
   fi
+  xml=$(fetch -fsS -m 3 "$url" 2>/dev/null) || return 1
+  [[ -n $xml ]] || return 1
+  dlna_udn <<<"$xml" || return 2
+}
+
+# verify_device <url> <saved-id>: true only if the device at the address
+# reports the saved ID. On failure DEV_ERR is "noid", "down" or "changed".
+DEV_ERR=""
+verify_device() {
+  local url=$1 want=$2 got rc tries=${3:-1}
+  DEV_ERR=noid
+  [[ $want =~ $DEV_ID_RE ]] || return 1
+  while :; do
+    rc=0
+    got=$(device_id "$url") || rc=$?
+    ((rc == 1 && --tries > 0)) || break
+    sleep 1
+  done
+  DEV_ERR=down
+  ((rc == 1)) && return 1
+  DEV_ERR=changed
+  ((rc == 0)) && [[ $got == "$want" ]] || return 1
+  DEV_ERR=""
 }
 
 soap() { soap_call "$(state_get control)" "$AVT" "$@"; } # soap <action> [inner-xml]
@@ -397,7 +442,10 @@ transport_state() {
     printf '%s\n' "$st"
     return
   fi
-  soap GetTransportInfo | xpath_str "//*[local-name()='CurrentTransportState']"
+  local st
+  st=$(soap GetTransportInfo | xpath_str "//*[local-name()='CurrentTransportState']")
+  [[ $st =~ ^[A-Z_]{1,40}$ ]] || st=UNKNOWN
+  printf '%s\n' "$st"
 }
 
 position_info() { # prints "<pos-seconds> <duration-seconds>"
@@ -418,7 +466,8 @@ dev_status() {
   if [[ $(active_type) == chromecast ]]; then cc_status; return; fi
   st=$(transport_state 2>/dev/null)
   read -r pos dur < <(position_info 2>/dev/null) || true
-  printf '%s %s %s\n' "${st:-UNKNOWN}" "${pos:-0}" "${dur:-0}"
+  [[ $st =~ ^[A-Z_]{1,40}$ ]] || st=UNKNOWN
+  printf '%s %s %s\n' "$st" "$(uint "$pos")" "$(uint "$dur")"
 }
 
 # dev_control pause|play|stop|seek <secs>: send a transport command to the
@@ -513,7 +562,7 @@ rc_info() {
       max=$(uint "$(jq -r '.max // 0' <<<"$cache")")
       if [[ -n $ctl ]]; then
         [[ $(url_origin "$ctl") == "$(url_origin "$desc")" ]] && lan_url "$ctl" && ((max > 0)) || return 1
-        printf '%s %s\n' "$ctl" "$max"
+        printf '%s\t%s\n' "$ctl" "$max"
         return 0
       fi
       [[ $(jq -r --argjson now "$now" '((.checked // 0) | tonumber? // 0) + 60 > $now' <<<"$cache") == true ]] && return 1
@@ -533,7 +582,20 @@ rc_info() {
   jq -cn --arg d "$desc" --arg c "$ctl" --argjson m "$max" --argjson t "$now" \
     '{device: $d, control: $c, max: $m, checked: $t}' >"$RC_FILE"
   [[ -n $ctl ]] || return 1
-  printf '%s %s\n' "$ctl" "$max"
+  printf '%s\t%s\n' "$ctl" "$max"
+}
+
+# rc_get: sets RC_CTL and RC_MAX for the active DLNA device. The fields are
+# split on the tab rc_info writes, and the maximum always goes through uint.
+RC_CTL="" RC_MAX=0
+rc_get() {
+  local line
+  RC_CTL="" RC_MAX=0
+  line=$(rc_info) || return 1
+  [[ $line == *$'\t'* ]] || return 1
+  RC_CTL=${line%%$'\t'*}
+  RC_MAX=$(uint "${line##*$'\t'}")
+  [[ -n $RC_CTL ]] && ((RC_MAX > 0))
 }
 
 rc_soap() { # rc_soap <control-url> <action> [inner-xml]
@@ -552,7 +614,8 @@ dev_volume() {
     echo "$vol $muted"
     return
   fi
-  read -r ctl max < <(rc_info) || return 1
+  rc_get || return 1
+  ctl=$RC_CTL max=$RC_MAX
   raw=$(rc_soap "$ctl" GetVolume | xpath_str "//*[local-name()='CurrentVolume']") || return 1
   [[ $raw =~ ^[0-9]{1,5}$ ]] || return 1
   raw=$(uint "$raw")
@@ -572,7 +635,8 @@ dev_set_volume() {
     dev_control volume "$pct"
     return
   fi
-  read -r ctl max < <(rc_info) || return 1
+  rc_get || return 1
+  ctl=$RC_CTL max=$RC_MAX
   raw=$(((pct * max + 50) / 100))
   if [[ $dir == 1 || $dir == -1 ]] && ((raw == (cur * max + 50) / 100)); then
     raw=$((raw + dir))
@@ -589,13 +653,15 @@ dev_set_mute() { # dev_set_mute 0|1
     if ((on)); then dev_control mute on; else dev_control mute off; fi
     return
   fi
-  read -r ctl _ < <(rc_info) || return 1
+  rc_get || return 1
+  ctl=$RC_CTL
   rc_soap "$ctl" SetMute "<DesiredMute>$on</DesiredMute>" >/dev/null
 }
 
 # ---------- discovery ----------
 
-# discover: prints "name<TAB>url<TAB>type" per device (dlna|chromecast).
+# discover: prints "name<TAB>url<TAB>type<TAB>id" per device (dlna|chromecast;
+# id is empty when the device announced none).
 # Discovery is tvcast's own, not `go2tv -l`: go2tv fetches every SSDP
 # LOCATION it hears before returning a list, and accepts any host, so a LAN
 # responder could make it send requests anywhere (reported by a marketplace
@@ -623,21 +689,24 @@ discover() {
   while read -r loc; do
     # At most four description fetches at once.
     while (($(jobs -rp | wc -l) >= 4)); do wait -n; done
+    i=$((i + 1))
     (
       xml=$(fetch -fsS -m 3 "$loc" 2>/dev/null) || exit 0
       [[ -n $(xpath_str "//*[local-name()='service']/*[local-name()='serviceType'][contains(., 'AVTransport')]" <<<"$xml") ]] || exit 0
       # Clean before the name enters the tab-separated list: a raw tab or
       # newline in friendlyName could otherwise forge a second entry.
       name=$(xpath_str "//*[local-name()='device']/*[local-name()='friendlyName']" <<<"$xml" | clean_text 120)
-      printf '%s\t%s\tdlna\n' "$name" "$loc"
-    ) >"$dir/dlna.$((++i))" &
+      [[ -n $name ]] || name=TV
+      printf '%s\t%s\tdlna\t%s\n' "$name" "$loc" "$(dlna_udn <<<"$xml")"
+    ) >"$dir/dlna.$i" &
   done <"$dir/locations"
   wait
   for f in "$dir"/dlna.* "$dir/mdns"; do
     [[ -s $f ]] || continue
     head -n "$MAX_DEVICES" "$f"
-  done | while IFS=$'\t' read -r name url tag; do
+  done | while IFS=$'\t' read -r name url tag id; do
     lan_url "$url" || continue
+    [[ $id =~ $DEV_ID_RE ]] || id=""
     # A DLNA entry must be one of the vetted SSDP locations (the replying host).
     [[ $tag != dlna ]] || grep -qxF -- "$url" "$dir/locations" || continue
     # go2tv routes -t by port alone, so skip anything it would misroute
@@ -645,7 +714,7 @@ discover() {
     [[ $tag == "$(url_type "$url")" ]] || continue
     name=$(clean_text 120 <<<"$name")
     [[ -n $name ]] || name=TV
-    printf '%s\t%s\t%s\n' "$name" "$url" "$tag"
+    printf '%s\t%s\t%s\t%s\n' "$name" "$url" "$tag" "$id"
   done | sort -u -t $'\t' -k2,2
   rm -rf "$dir"
 }
@@ -654,7 +723,7 @@ cmd_devices() {
   local list
   list=$(discover)
   if [[ ${1:-} == --json ]]; then
-    jq -Rn '[inputs | split("\t") | select(length == 3) | {name: .[0], url: .[1], type: .[2]}]' <<<"$list"
+    jq -Rn '[inputs | split("\t") | select(length == 4) | {name: .[0], url: .[1], type: .[2], id: .[3]}]' <<<"$list"
   else
     [[ -n $list ]] && printf '%s\n' "$list"
   fi
@@ -669,20 +738,22 @@ url_host() {
   printf '%s\n' "${o%:*}"
 }
 
-# choose_device [--pick]: prints "name<TAB>url" (the type follows from the URL).
-# Reuses the cached TV when it answers, unless --pick. A newly discovered device is never trusted on its
-# own: without --pick, discovery only auto-selects a device at the exact
-# description URL we already know; anything else (a single new device included)
-# goes through the menu, which shows each device's IP address.
+# choose_device [--pick]: prints "name<TAB>url<TAB>id" (the type follows from the URL).
+# Reuses the saved TV only while the device at its address reports the saved
+# ID, unless --pick. A newly discovered device is never trusted on its own:
+# without --pick, discovery only auto-selects a device at the exact description
+# URL we already know that also reports the saved ID; anything else (a single
+# new device, or a different device at the old address) goes through the menu,
+# which shows each device's IP address. A TV saved without an ID (tvcast 0.5.5
+# and older) is offered in the menu once, preselected.
 choose_device() {
-  local pick=${1:-} cached="" known="" name url list choice label
-  if [[ -s $DEVICE_FILE ]]; then
-    cached=$(<"$DEVICE_FILE")
-    known=${cached#*$'\t'}
-  fi
-  [[ -n $known ]] || known=$(q_get '.device.url // empty')
-  if [[ -z $pick && -n $cached ]] && reachable "$known"; then
-    printf '%s\n' "$cached"
+  local pick=${1:-} sname="" surl="" sid="" known="" kid="" name url id list choice label
+  [[ -s $DEVICE_FILE ]] && IFS=$'\t' read -r sname surl sid <"$DEVICE_FILE"
+  known=$surl kid=$sid
+  [[ -n $known ]] || { known=$(q_get '.device.url // empty'); kid=$(q_get '.device.id // empty'); }
+  [[ $kid =~ $DEV_ID_RE ]] || kid=""
+  if [[ -z $pick && -n $sname && -n $surl ]] && verify_device "$surl" "$sid"; then
+    printf '%s\t%s\t%s\n' "$sname" "$surl" "$sid"
     return
   fi
 
@@ -691,27 +762,27 @@ choose_device() {
   [[ -n $list ]] || return 1
 
   choice=""
-  if [[ -z $pick && -n $known ]]; then
-    while IFS=$'\t' read -r name url _; do
-      [[ $url == "$known" ]] && { choice=$name$'\t'$url; break; }
+  if [[ -z $pick && -n $known && -n $kid ]]; then
+    while IFS=$'\t' read -r name url _ id; do
+      [[ $url == "$known" && $id == "$kid" ]] && { choice=$name$'\t'$url$'\t'$id; break; }
     done <<<"$list"
   fi
 
   if [[ -z $choice ]]; then
     local options=() selected=() picked
     local type
-    while IFS=$'\t' read -r name url type; do
+    while IFS=$'\t' read -r name url type id; do
       if [[ $type == chromecast ]]; then type=Chromecast; else type=DLNA; fi
       label="$name  ($(url_host "$url"), $type)"
       options+=("󰔂"$'\t'"$label"$'\t'"$url")
-      [[ $url == "$known" ]] && selected=(--selected "$label"$'\t'"$url")
+      [[ $url == "$known" && ( -z $kid || $id == "$kid" ) ]] && selected=(--selected "$label"$'\t'"$url")
     done <<<"$list"
     picked=$(omarchy-menu-select "Cast to" "${options[@]}" -- "${selected[@]}") || return 2
     [[ -n $picked ]] || return 2
     # The menu returns "label<TAB>url"; map the URL back to the device's name.
     url=${picked##*$'\t'}
-    while IFS=$'\t' read -r name label _; do
-      [[ $label == "$url" ]] && { choice=$name$'\t'$label; break; }
+    while IFS=$'\t' read -r name label _ id; do
+      [[ $label == "$url" ]] && { choice=$name$'\t'$label$'\t'$id; break; }
     done <<<"$list"
     [[ -n $choice ]] || return 2
   fi
@@ -721,15 +792,31 @@ choose_device() {
 
 # ---------- media inspection ----------
 
-ext_of() { local e=${1##*.}; echo "${e,,}"; }
+ext_of() { local b=${1##*/} e=""; [[ $b == *.* ]] && e=${b##*.}; echo "${e,,}"; }
 
-media_kind() { # video|audio|image
+# Only local video, audio and image files are cast, by content type. go2tv
+# reads a -v path ending in .torrent as a BitTorrent session whatever its
+# content, and playlists or SVGs make the TV or ffmpeg fetch other URLs, so
+# those are refused too. Checked when files are queued and again on the open
+# file right before go2tv gets it.
+DENY_MIME=" audio/x-mpegurl audio/mpegurl audio/x-scpls audio/scpls image/svg+xml video/x-ms-asx audio/x-ms-wax video/x-ms-wvx "
+
+# mime_of <path>: content type. file(1) reads stdin because its sandbox can't
+# open /proc/<pid>/fd links. Only call it on a path known to be a regular file.
+mime_of() { file -b --mime-type - <"$1" 2>/dev/null; }
+
+media_ok() { # media_ok <name> <mime>
+  local mime=${2,,}
+  [[ $(ext_of "$1") != torrent && $mime =~ ^(video|audio|image)/ && $DENY_MIME != *" $mime "* ]]
+}
+
+media_kind() { # media_kind <name> <mime>: video|audio|image
   local e
   e=$(ext_of "$1")
   if [[ " $IMAGE_EXT " == *" $e "* ]]; then echo image
   elif [[ " $AUDIO_EXT " == *" $e "* ]]; then echo audio
   else
-    case $(file -b --mime-type -- "$1" 2>/dev/null) in
+    case ${2,,} in
       image/*) echo image ;;
       audio/*) echo audio ;;
       *) echo video ;;
@@ -737,14 +824,36 @@ media_kind() { # video|audio|image
   fi
 }
 
-# needs_transcode <file>: exit 0 when the TV likely can't play the video as is.
+# A queued file is identified by filesystem ID, inode and birth time
+# (stat -f %i, not st_dev: btrfs device numbers can change across reboots).
+FILE_ID_RE='^[0-9a-f]{1,16}:[0-9]{1,20}:[0-9]{1,20}$'
+file_id() { # file_id <path>
+  local fs ino
+  fs=$(stat -f -L -c %i -- "$1" 2>/dev/null) || return 1
+  ino=$(stat -L -c %i:%W -- "$1" 2>/dev/null) || return 1
+  [[ $fs:$ino =~ $FILE_ID_RE ]] && printf '%s\n' "$fs:$ino"
+}
+
+# open_regular <path>: opens the file read-only on OPEN_FD, only if it is a
+# regular file (a FIFO would block the open).
+OPEN_FD=""
+open_regular() {
+  OPEN_FD=""
+  [[ -f $1 ]] || return 1
+  { exec {OPEN_FD}<"$1"; } 2>/dev/null || { OPEN_FD=""; return 1; }
+  [[ -f /proc/$BASHPID/fd/$OPEN_FD ]] && return 0
+  exec {OPEN_FD}<&-
+  OPEN_FD=""
+  return 1
+}
+
+# needs_transcode <video>: exit 0 when the TV likely can't play the video as is.
 needs_transcode() {
   local f=$1 e streams vcodec acodecs a
   case ${TVCAST_TRANSCODE:-auto} in
     always) return 0 ;;
     never) return 1 ;;
   esac
-  [[ $(media_kind "$f") == video ]] || return 1
   e=$(ext_of "$f")
   [[ $OK_CONTAINERS == *" $e "* ]] || return 0
   streams=$(ffprobe -v error -protocol_whitelist file -show_entries stream=codec_type,codec_name -of csv=p=0 -- "$f" 2>/dev/null) || return 0
@@ -757,15 +866,79 @@ needs_transcode() {
   return 1
 }
 
-# subtitle_for <file>: a sidecar with the same name (movie.srt, movie.en.srt, ...)
+# subtitle_for <file>: a sidecar with the same name, movie.srt or movie.<lang>.srt
+# (lang: 2-8 letters or dashes, e.g. en, pt-BR).
 subtitle_for() {
-  local f=$1 stem ext cand
+  local f=$1 stem ext cand lang
   stem=${f%.*}
   for ext in srt vtt ass ssa; do
     for cand in "$stem.$ext" "$stem".*."$ext"; do
+      lang=${cand#"$stem".}
+      lang=${lang%."$ext"}
+      [[ $cand == "$stem.$ext" || $lang =~ ^[A-Za-z-]{2,8}$ ]] || continue
       [[ -f $cand ]] && { printf '%s\n' "$cand"; return; }
     done
   done
+}
+
+# ---------- serving the queued file ----------
+# go2tv opens its -v and -s paths again for every HTTP request, so a path that
+# changes after it was queued would serve another file. The runner opens the
+# queued file once, checks it is the same file (file_id) and still media, and
+# hands go2tv a symlink with the original name, in a private dir, to
+# /proc/<runner>/fd/<n>: every open by go2tv or ffmpeg lands on that file.
+# The name keeps go2tv's URL, title and extension checks as before. Subtitles
+# are copied into the same dir. Sidecar cover art (cover.jpg) is not shown:
+# go2tv only reads it from the media file's own directory.
+MEDIA_FD="" PLAY_DIR="" PLAY_FILE="" PLAY_SUBS="" PLAY_KIND="" PIN_ERR=""
+MAX_SUBS=8388608
+
+unpin() {
+  [[ -n $MEDIA_FD ]] && exec {MEDIA_FD}<&-
+  [[ -n $PLAY_DIR ]] && rm -rf -- "$PLAY_DIR"
+  MEDIA_FD="" PLAY_DIR="" PLAY_FILE="" PLAY_SUBS="" PLAY_KIND=""
+}
+
+# pin_media <file> <file-id>: on success sets PLAY_FILE (and PLAY_SUBS for a
+# video with a sidecar) and PLAY_KIND; on failure PIN_ERR says why.
+pin_media() {
+  local file=$1 want=$2 p mime sub real fd
+  unpin
+  PIN_ERR="it was queued by an older version of tvcast. Add it again."
+  [[ $want =~ $FILE_ID_RE ]] || return 1
+  PIN_ERR="it is not a local file."
+  [[ $file == /* && $file != *://* ]] || return 1
+  PIN_ERR="the file is missing."
+  open_regular "$file" || return 1
+  MEDIA_FD=$OPEN_FD
+  p=/proc/$BASHPID/fd/$MEDIA_FD
+  PIN_ERR="the file was replaced or changed since it was queued (or its drive was remounted). Add it again."
+  [[ $(file_id "$p") == "$want" ]] || { unpin; return 1; }
+  mime=$(mime_of "$p")
+  PIN_ERR="it is not a video, audio or image file."
+  media_ok "$file" "$mime" || { unpin; return 1; }
+  PLAY_KIND=$(media_kind "$file" "$mime")
+  PIN_ERR="could not prepare it for playback."
+  PLAY_DIR=$(mktemp -d "$CACHE_DIR/play.XXXXXX") || { unpin; return 1; }
+  PLAY_FILE=$PLAY_DIR/${file##*/}
+  ln -s -- "$p" "$PLAY_FILE" || { unpin; return 1; }
+  PIN_ERR=""
+  [[ $PLAY_KIND == video ]] || return 0
+  sub=$(subtitle_for "$file")
+  [[ -n $sub ]] || return 0
+  # Only a sidecar that really lives next to the video, never one that links elsewhere.
+  real=$(readlink -f -- "$sub") || return 0
+  [[ ${real%/*} == "${file%/*}" ]] || return 0
+  open_regular "$real" || return 0
+  fd=$OPEN_FD
+  mime=$(mime_of "/proc/$BASHPID/fd/$fd")
+  if [[ $mime =~ ^(text/|application/x-subrip$) ]] &&
+    (($(stat -L -c %s -- "/proc/$BASHPID/fd/$fd" 2>/dev/null || echo "$MAX_SUBS") < MAX_SUBS)) &&
+    head -c "$MAX_SUBS" <&"$fd" >"$PLAY_DIR/${sub##*/}"; then
+    PLAY_SUBS=$PLAY_DIR/${sub##*/}
+  fi
+  exec {fd}<&-
+  return 0
 }
 
 # ---------- queue ----------
@@ -801,21 +974,43 @@ q_update() { # q_update [jq args...] <filter>
 q_count() { uint "$(q_get '.items | length')"; }
 q_index() { uint "$(q_get '.index')"; }
 
-items_json() { # items_json <file...>: JSON array of queue items, skipping non-files
-  local f
+# items_json <file...>: JSON array of queue items. Anything that is not a
+# local regular video, audio or image file is skipped (URLs, "-", torrents,
+# playlists). Each item records the file's file_id, so the runner can tell
+# when the path no longer names the file that was picked.
+items_json() {
+  local f p mime id title
   for f in "$@"; do
+    if [[ $f == - || $f == *://* || ${f,,} == magnet:* ]]; then
+      echo "tvcast: skipping $f (not a local file)" >&2
+      continue
+    fi
     f=$(readlink -f -- "$f") || continue
-    [[ -f $f ]] || { echo "tvcast: skipping $f (not a file)" >&2; continue; }
-    jq -cn --arg file "$f" --arg title "$(basename -- "${f%.*}" | clean_text 200)" --arg kind "$(media_kind "$f")" \
-      '{file: $file, title: $title, kind: $kind}'
+    if [[ $f == *://* ]] || ! open_regular "$f"; then
+      echo "tvcast: skipping $f (not a file)" >&2
+      continue
+    fi
+    p=/proc/$BASHPID/fd/$OPEN_FD
+    mime=$(mime_of "$p")
+    id=$(file_id "$p")
+    exec {OPEN_FD}<&-
+    if [[ -z $id ]] || ! media_ok "$f" "$mime"; then
+      echo "tvcast: skipping $f (not a video, audio or image file)" >&2
+      continue
+    fi
+    title=${f##*/}
+    [[ $title == ?*.* ]] && title=${title%.*}
+    jq -cn --arg file "$f" --arg title "$(clean_text 200 <<<"$title")" --arg kind "$(media_kind "$f" "$mime")" \
+      --arg id "$id" '{file: $file, title: $title, kind: $kind, id: $id}'
   done | jq -cs .
 }
 
-# ensure_device [--pick]: make sure the queue names a reachable TV.
+# ensure_device [--pick]: make sure the queue names a TV that still reports
+# the ID it was saved with.
 ensure_device() {
-  local pick=${1:-} url dev name ctl type
+  local pick=${1:-} url dev name ctl type id
   url=$(q_get '.device.url // empty')
-  if [[ -z $pick && -n $url ]] && reachable "$url"; then
+  if [[ -z $pick && -n $url ]] && verify_device "$url" "$(q_get '.device.id // empty')"; then
     return 0
   fi
   dev=$(choose_device "$pick")
@@ -824,8 +1019,9 @@ ensure_device() {
     2) return 2 ;;
     *) die "No TV found on the network. Is it on and on the same network?" ;;
   esac
-  name=${dev%%$'\t'*}
-  url=${dev#*$'\t'}
+  IFS=$'\t' read -r name url id <<<"$dev"
+  [[ $id =~ $DEV_ID_RE ]] ||
+    die "$name does not report a device ID, so tvcast can't tell it apart from another device that later gets its address."
   type=$(url_type "$url")
   if [[ $type == chromecast ]]; then
     # A Chromecast is controlled at its own cast address, there's no description.
@@ -834,8 +1030,8 @@ ensure_device() {
   else
     ctl=$(control_url "$url") || die "$name does not offer DLNA playback control."
   fi
-  q_update --arg name "$name" --arg url "$url" --arg control "$ctl" --arg type "$type" \
-    '.device = {name: $name, url: $url, control: $control, type: $type}'
+  q_update --arg name "$name" --arg url "$url" --arg control "$ctl" --arg type "$type" --arg id "$id" \
+    '.device = {name: $name, url: $url, control: $control, type: $type, id: $id}'
 }
 
 start_runner() {
@@ -932,9 +1128,11 @@ wait_item_end() {
 }
 
 cmd_run() {
-  trap 'kill_player; exit 0' TERM INT
-  local q count idx item file title kind subs tc args name url ctl last type blind=""
+  trap 'kill_player; unpin' EXIT
+  trap 'exit 0' TERM INT
+  local q count idx item file fid title kind subs tc args name url ctl devid last type blind=""
   export TVCAST_IN_RUNNER=1
+  rm -rf -- "$CACHE_DIR"/play.*
   while :; do
     q=$(q_read)
     count=$(uint "$(jq '.items | length' <<<"$q")")
@@ -945,12 +1143,13 @@ cmd_run() {
       exit 0
     fi
     item=$(jq -c --argjson i "$idx" '.items[$i]' <<<"$q")
-    file=$(jq -r .file <<<"$item")
+    file=$(jq -r '.file // empty' <<<"$item")
+    fid=$(jq -r '.id // empty' <<<"$item")
     title=$(jq -r .title <<<"$item")
-    kind=$(jq -r .kind <<<"$item")
     name=$(jq -r '.device.name // "TV"' <<<"$q")
     url=$(jq -r '.device.url // empty' <<<"$q")
     ctl=$(jq -r '.device.control // empty' <<<"$q")
+    devid=$(jq -r '.device.id // empty' <<<"$q")
     [[ -n $url && -n $ctl ]] || die "No TV selected."
     # The queue file is re-read on every item; never hand go2tv a URL that
     # wouldn't pass discovery.
@@ -963,25 +1162,36 @@ cmd_run() {
     [[ $type == chromecast ]] || blind=""
     rm -f "$CC_STATUS_FILE"
 
-    if [[ ! -f $file ]]; then
-      notify normal "Cast to TV" "Skipping missing file: $title"
+    if ! pin_media "$file" "$fid"; then
+      notify normal "Cast to TV" "Skipping $title: $PIN_ERR"
       q_update --argjson i "$idx" '.index = $i + 1'
       continue
+    fi
+    kind=$PLAY_KIND
+
+    # Checked before every item: the address may now belong to another device.
+    # The state is reset first so the stop hook doesn't send Stop to it.
+    if ! verify_device "$url" "$devid" 3; then
+      write_state '{"active":false}'
+      case $DEV_ERR in
+        down) die "$name did not answer at $(url_host "$url"). Turn it on, then press Play." ;;
+        changed) die "The device at $(url_host "$url") is no longer $name. Pick the TV again in the TV Cast panel." ;;
+        *) die "tvcast now checks which TV it casts to. Pick the TV again in the TV Cast panel." ;;
+      esac
     fi
 
     # Checked before every launch, not only at the CLI entry points: a resumed
     # queue goes straight to the runner, and go2tv may be replaced mid-queue.
     require_go2tv
-    args=(-v "$file" -t "$url")
+    args=(-v "$PLAY_FILE" -t "$url")
     subs="" tc=0
     if [[ $kind == video ]]; then
-      subs=$(subtitle_for "$file")
-      [[ -n $subs ]] && args+=(-s "$subs")
+      [[ -n $PLAY_SUBS ]] && { args+=(-s "$PLAY_SUBS"); subs=${file%/*}/${PLAY_SUBS##*/}; }
       # go2tv picks Chromecast transcoding itself; the codec lists here are
       # for DLNA TVs, so on a Chromecast only TVCAST_TRANSCODE=always forces it.
       if [[ $type == chromecast ]]; then
         [[ ${TVCAST_TRANSCODE:-} == always ]] && { args+=(-tc); tc=1; }
-      elif needs_transcode "$file"; then
+      elif needs_transcode "$PLAY_FILE"; then
         args+=(-tc)
         tc=1
       fi
@@ -1007,6 +1217,7 @@ cmd_run() {
       notify normal "Cast to TV" "Couldn't play $title, skipping. See $LOG_FILE"
     fi
     kill_player
+    unpin
     # Advance only past the item we played; a concurrent edit may have moved it.
     q_update --argjson i "$idx" --arg file "$file" \
       'if (.items[$i].file // "") == $file then .index = $i + 1
@@ -1022,7 +1233,11 @@ pick_files() { # prints one path per line; exits quietly when nothing is picked
     --extensions "$VIDEO_EXT $AUDIO_EXT $IMAGE_EXT") || status=$?
   ((status > 1)) && die "The file chooser could not open."
   [[ -n $picked ]] || exit 0
-  printf '%s\n' "$picked"
+  # One absolute path per line. A line that doesn't start with / continues a
+  # file name containing a newline: that whole name is dropped, or its pieces
+  # would name other files.
+  grep -qv '^/' <<<"$picked" && notify normal "Cast to TV" "Skipped a file whose name contains a line break."
+  awk 'BEGIN { ok = 0 } /^\// { if (ok) print prev; prev = $0; ok = 1; next } { ok = 0 } END { if (ok) print prev }' <<<"$picked"
 }
 
 parse_pick() { # sets PICK and FILES from "[--pick] [file...]"
@@ -1032,14 +1247,23 @@ parse_pick() { # sets PICK and FILES from "[--pick] [file...]"
   FILES=("$@")
 }
 
+checked_items() { # JSON items for FILES; tells the user what was skipped
+  local items n skipped
+  items=$(items_json "${FILES[@]}")
+  n=$(uint "$(jq length <<<"$items")")
+  skipped=$((${#FILES[@]} - n))
+  ((n > 0)) || die "Nothing playable was picked. tvcast casts local video, audio and image files only."
+  ((skipped > 0)) && notify normal "Cast to TV" "Skipped $skipped that $( ((skipped == 1)) && echo "is not a local video, audio or image file" || echo "are not local video, audio or image files")."
+  printf '%s\n' "$items"
+}
+
 cmd_cast() { # replace the queue with these files and play from the first
   local items
   parse_pick "$@"
   require_go2tv
   ((${#FILES[@]})) || readarray -t FILES < <(pick_files "Cast to TV")
   ((${#FILES[@]})) || exit 0
-  items=$(items_json "${FILES[@]}")
-  [[ $(jq length <<<"$items") -gt 0 ]] || die "Nothing playable was picked."
+  items=$(checked_items) || exit 1
   stop_runner
   q_update --argjson items "$items" '.items = $items | .index = 0'
   ensure_device "$PICK" || exit 0
@@ -1051,8 +1275,7 @@ cmd_add() { # append; starts playing only when nothing is queued or playing
   parse_pick "$@"
   ((${#FILES[@]})) || readarray -t FILES < <(pick_files "Add to TV queue")
   ((${#FILES[@]})) || exit 0
-  items=$(items_json "${FILES[@]}")
-  [[ $(jq length <<<"$items") -gt 0 ]] || die "Nothing playable was picked."
+  items=$(checked_items) || exit 1
   before=$(q_count)
   if ((before == 0)); then
     q_update --argjson items "$items" '.items = $items | .index = 0'

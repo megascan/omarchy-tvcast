@@ -2,7 +2,7 @@
 """Find TVs on the LAN without contacting any host (tvcast's discovery).
 
     tvcast-discover ssdp [seconds]    prints "<reply-source-ip><TAB><LOCATION>"
-    tvcast-discover mdns [seconds]    prints "<name><TAB>http://<ip>:<port><TAB>chromecast"
+    tvcast-discover mdns [seconds]    prints "<name><TAB>http://<ip>:<port><TAB>chromecast<TAB><id>"
 
 Nothing here makes an HTTP request. tvcast validates every address it prints
 (private LAN IP, not this machine, LOCATION on the replying host) and only
@@ -41,7 +41,7 @@ SEARCH_TARGETS = (
 
 
 def clean(text, limit):
-    text = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", text)
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]", "", text)
     return text[:limit]
 
 
@@ -93,6 +93,10 @@ def ssdp(seconds):
         print(f"{src}\t{loc}", flush=True)
 
 
+def device_id(text):
+    return text if re.fullmatch(r"[A-Za-z0-9:._-]{1,128}", text) else ""
+
+
 def unescape_avahi(text):
     # avahi-browse -p writes special characters as \DDD (decimal).
     return re.sub(r"\\(\d{3})", lambda m: chr(int(m.group(1))), text)
@@ -124,8 +128,9 @@ def mdns_avahi(seconds, out):
             continue
         txt = unescape_avahi(f[9])
         m = re.search(r'"fn=([^"]*)"', txt)
-        name = m.group(1) if m else unescape_avahi(f[3])
-        out.add((clean(name, 120), f"http://{ip}:{int(port)}"))
+        name = m.group(1) if m and m.group(1) else unescape_avahi(f[3])
+        m = re.search(r'"id=([^"]*)"', txt)
+        out.add((clean(name, 120), f"http://{ip}:{int(port)}", device_id(m.group(1) if m else "")))
 
 
 def mdns_zeroconf(seconds, out):
@@ -152,11 +157,13 @@ def mdns_zeroconf(seconds, out):
         info = zc.get_service_info("_googlecast._tcp.local.", name, timeout=1000)
         if not info:
             continue
-        fn = (info.properties or {}).get(b"fn", b"") or name.split(".")[0].encode()
+        props = info.properties or {}
+        fn = props.get(b"fn", b"") or name.split(".")[0].encode()
+        did = device_id((props.get(b"id", b"") or b"").decode("utf-8", "replace"))
         for addr in info.parsed_addresses()[:4]:
             ip = ipv4(addr)
             if ip:
-                out.add((clean(fn.decode("utf-8", "replace"), 120), f"http://{ip}:{int(info.port)}"))
+                out.add((clean(fn.decode("utf-8", "replace"), 120), f"http://{ip}:{int(info.port)}", did))
     zc.close()
 
 
@@ -166,8 +173,8 @@ def mdns(seconds):
         mdns_avahi(seconds, out)
     else:
         mdns_zeroconf(seconds, out)
-    for name, url in sorted(out)[:MAX_REPLIES]:
-        print(f"{name}\t{url}\tchromecast")
+    for name, url, did in sorted(out)[:MAX_REPLIES]:
+        print(f"{name or 'TV'}\t{url}\tchromecast\t{did}")
 
 
 def main(argv):

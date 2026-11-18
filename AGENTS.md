@@ -163,8 +163,8 @@
   `mkstemp` beside the real (symlink-resolved) file.
 - **By design, documented in the README:** go2tv's media server is unauthenticated
   HTTP on the TV-facing address while a file plays. The README's first firewall rule
-  is scoped to the TV's IP. File paths appear in go2tv's argv (a same-basename symlink
-  was rejected: go2tv's artwork lookup reads the file's real directory). go2tv pins
+  is scoped to the TV's IP. go2tv's argv carries only the private play-dir symlink
+  (see 0.5.6), so the file's name, not its directory, shows in `ps`. go2tv pins
   the renderer IP but not the port, so it may use another port on the same device.
 - **Gate at the point of use, not at entry points.** The go2tv version check runs in
   `start_runner` and right before every go2tv launch in the runner loop, because resume paths
@@ -205,3 +205,54 @@
 - **The real TV is someone's living room.** Never start, resume or seek the user's own media
   on it for a test without asking first. Test on the item the user names, put the queue back
   to how it was, and leave the TV paused or stopped as you found it, never playing.
+
+## Review round 0.5.6 (marketplace review #15258 plus a sweep)
+
+- **An address is not an identity.** A saved device carries `id` (DLNA: root device UDN
+  via `dlna_udn`; Chromecast: mDNS TXT `id`, re-read with `tvcast-discover mdns`).
+  `verify_device` must pass before reuse in `choose_device`/`ensure_device` and before
+  every item in the runner. Auto-select after discovery needs URL **and** ID equal.
+  Mismatch or no ID: picker (CLI) or die (runner, after `write_state '{"active":false}'`
+  so `_cleanup` doesn't send Stop to the other device). Devices saved by 0.5.5 have no ID
+  and are re-picked once; never record an ID on first contact (that trusts the address
+  again). The ID is self-announced: it catches DHCP reassignment, not spoofing.
+  Test: fake TV, switch its UDN mid-queue; the picker must open, the runner must die.
+- **Media allowlist at queue time and in the runner** (`media_ok`): content MIME from
+  `file -b --mime-type -` reading stdin (file's sandbox can't open `/proc/<pid>/fd`
+  links) must be video/audio/image, minus `DENY_MIME` (playlists, SVG, ASX), and the
+  extension must not be `.torrent` (go2tv 2.9.0 starts BitTorrent for any `-v *.torrent`,
+  whatever the content). Raw args `-`, `*://*`, `magnet:*` are refused. Test every
+  extension the picker offers plus `.torrent`, a real MP4 renamed `.TORRENT`, `.m3u8`,
+  `.pls`, `.svg`, a URL and `-`, in `cast`/`add` and as hand-edited queue entries.
+- **Serve the file that was picked, not whatever the path names later.** go2tv re-opens
+  `-v`/`-s` paths on every HTTP request. Queue items record `file_id` (statfs id, inode,
+  birth time; not `st_dev`, which btrfs renumbers). `pin_media` opens the file in the
+  runner's main shell, checks `file_id` and MIME on the fd, and gives go2tv
+  `$CACHE_DIR/play.XXXXXX/<original name>` -> `/proc/<runner>/fd/<n>`. The original name
+  keeps go2tv's URL, DIDL title, MIME and extension logic intact (a bare `/proc/.../fd/N`
+  would not). Subtitles are copied (size-capped) into that dir, and only from a sidecar
+  whose real path is in the video's own directory. Lost by design: sidecar cover art
+  (go2tv only scans the media's directory for regular files). Close the fd only after
+  `kill_player`; stale `play.*` dirs are removed at runner start. Items without `id`
+  are skipped. Test: real go2tv against a loopback fake renderer, fetch the media URL,
+  `mv` another file over the path, fetch again: same bytes.
+- **Device text never reaches arithmetic or a multi-field `read`.** A same-origin
+  controlURL `"/ctl UNIT[$(cmd)]"` once ran `cmd`: `rc_info` printed `"$ctl $max"`,
+  `read -r ctl max` put device text into `max`, and `((raw > max))` evaluated it.
+  Rules: `url_origin` accepts only `[[:graph:]]` after the origin (no space, tab, CR, LF);
+  helpers that print several fields use a tab and are split explicitly (`rc_get`);
+  every number goes through `uint` and every state word through `^[A-Z_]{1,40}$`
+  (`transport_state`, `dev_status`) before `(( ))`, `$(( ))`, `[[ -lt ]]` or a subscript.
+  Test with controlURLs containing a space, a tab and a newline plus `$(touch marker)`,
+  a hand-edited `rendering` cache, and a CurrentTransportState of
+  `PLAYING x[$(touch marker)]`, then run `volume`, `volume 50`, `mute`, `status --json`
+  and `toggle`: no marker, no request.
+- **Smaller rules from the same sweep:** CURL runs with `-g` (no URL globbing of device
+  paths); counters for background jobs are incremented in the parent, not inside
+  `>"$((++i))" &`; an empty friendlyName becomes `TV` before it enters a tab record (IFS
+  collapses empty tab fields); `clean_text` also strips U+200B-200F, U+202A-202E,
+  U+2066-2069, U+FEFF; `pick_files` drops any picked name containing a newline; sidecars
+  are only `stem.ext` or `stem.<lang>.ext`; `ext_of` and titles use the basename.
+- **Never `pkill -f`/`pgrep -f` a pattern that appears in your own command line**, and
+  never a go2tv pattern at all: the user's live go2tv matches too. Kill test processes
+  by the PID you saved.

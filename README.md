@@ -28,7 +28,12 @@ RenderingControl, or over the Cast protocol for a Chromecast.
   audio plays as-is. Everything else gets go2tv's ffmpeg transcode (`-tc`).
   On a Chromecast, go2tv makes that call itself.
 - **Subtitles:** a sidecar with the same name (`movie.srt`, `movie.en.srt`, `.vtt`,
-  `.ass`, `.ssa`) is sent along automatically.
+  `.ass`, `.ssa`) is sent along automatically. A sidecar that links to a file in
+  another folder is ignored.
+- **Files:** only local video, audio and image files are queued, judged by their
+  content (`file --mime-type`), not their name. Torrent files, playlists (`.m3u`,
+  `.pls`), SVG images, URLs and `-` are refused when you queue them, and checked
+  again right before each file plays.
 - **Images** stay on screen for 10 s (`TVCAST_IMAGE_SECONDS`), or until you stop if
   the image is last in the queue.
 - **Menu entries** (optional): Trigger › Cast to TV, also `omarchy menu summon cast`.
@@ -115,6 +120,24 @@ If the widget isn't on the bar yet: `omarchy bar put megascan.tvcast --section r
 The first cast looks for TVs on the network (about 5 s). The chosen TV is remembered,
 and "Cast files to another TV…" (or `tvcast cast --pick`) searches again.
 
+tvcast saves the TV's device ID with it (the DLNA UDN, or the Chromecast's mDNS
+`id`) and checks it before every cast and before every file in the queue. If
+another device answers at that address now, for example after the router gave
+the TV's address to something else, tvcast shows the TV picker instead of
+casting; in the middle of a queue it stops and tells you. The ID is what the
+device says about itself, so this catches a reassigned address, not a device
+that pretends to be your TV. After updating from 0.5.5 or older you pick the TV
+once more.
+
+When you queue a file, tvcast records which file the path names. Before playing
+it, tvcast opens that file once and hands go2tv the open file, not the path. If the file was renamed, replaced or deleted in the meantime, the item is
+skipped with a notification, and replacing the file during playback doesn't
+change what the TV gets. On FAT/exFAT drives and network mounts (SMB, sshfs)
+file numbers can change when the drive is mounted again, so a queue saved there
+may need its files added again after a remount or reboot. Queue entries saved by 0.5.5 or older are skipped; add
+them again. One side effect: cover art from a `cover.jpg` or `folder.jpg` next to
+an audio file is no longer shown on the TV (art embedded in the file still is).
+
 ## Command line
 
 ```
@@ -159,7 +182,7 @@ helper runs under a timeout and a memory limit. Device names are stripped of
 control characters and shortened.
 `TVCAST_ALLOW_LOOPBACK=1` also allows 127.0.0.1, for testing against a fake TV.
 
-Privacy: the file's path is on go2tv's command line while it plays, like any
+Privacy: the file's name is on go2tv's command line while it plays, like any
 media player, so other local accounts can see it in `ps`. The TV, and anything
 that can reach the media port, sees its name.
 
