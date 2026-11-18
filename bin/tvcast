@@ -1,7 +1,9 @@
 #!/bin/bash
 
-# tvcast: cast local video, audio and image files to a DLNA TV with go2tv,
-# as a play queue, with playback control over UPnP AVTransport.
+# tvcast: cast local video, audio and image files to a DLNA TV or a Chromecast
+# with go2tv, as a play queue. DLNA is controlled over UPnP AVTransport;
+# Chromecast (experimental) through bin/tvcast-chromecast, which needs the
+# optional python-pychromecast.
 #
 #   tvcast cast [--pick] [file...]   replace the queue and play (picker if no files)
 #   tvcast add [--pick] [file...]    append to the queue (starts it if empty)
@@ -16,13 +18,14 @@
 #   tvcast seek-to <secs>            jump to an absolute position (clamped)
 #   tvcast stop                      stop playback, keep the queue
 #   tvcast status [--json]           now playing (+ TV state and position)
-#   tvcast devices [--json]          discover TVs (takes a few seconds)
+#   tvcast devices [--json]          discover TVs and Chromecasts (a few seconds)
 #   tvcast pick-device               discover and choose the TV to cast to
 #   tvcast active | has-queue [min]  exit 0 while casting / while queued
 #
 # Playback runs as the transient user unit tvcast.service ("tvcast _run"),
 # which plays the queue item by item: go2tv under script(1) (its CLI needs a
-# terminal), and the end of each file is detected by polling the TV.
+# terminal), and the end of each file is detected by polling the TV (DLNA)
+# or the Chromecast's media status, plus go2tv exiting at the end (Chromecast).
 # --pick searches the network for TVs instead of reusing the last one.
 
 # jq filters are single-quoted on purpose; $vars in them are jq variables.
@@ -39,7 +42,10 @@ LOG_FILE=$CACHE_DIR/session.log
 STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/tvcast
 QUEUE_FILE=$STATE_DIR/queue.json
 LOCK_FILE=$STATE_DIR/lock
+CC_STATUS_FILE=$CACHE_DIR/chromecast-status
 AVT=urn:schemas-upnp-org:service:AVTransport:1
+CAST_HELPER=${TVCAST_CAST_HELPER:-${SELF%/*}/tvcast-chromecast}
+PYCHROMECAST_HINT="Chromecast pause, seek and progress need python-pychromecast (sudo pacman -S python-pychromecast)."
 
 # Extensions offered by the file picker.
 VIDEO_EXT="mp4 m4v mkv webm mov avi wmv flv mpg mpeg ts m2ts 3gp ogv"
@@ -171,8 +177,35 @@ device_name() { # device_name <desc-url>
   fetch -fsS -m 3 "$1" 2>/dev/null | xpath_str "//*[local-name()='device']/*[local-name()='friendlyName']"
 }
 
-# reachable <url>: true if a LAN URL answers.
-reachable() { lan_url "$1" && "${CURL[@]}" -fsS -m 2 -o /dev/null "$1" 2>/dev/null; }
+# url_type <url>: chromecast or dlna, by the rule go2tv itself uses to route
+# -t (port 8009 is a Chromecast), so we never disagree with go2tv.
+url_type() {
+  local o
+  o=$(url_origin "$1") || { echo dlna; return; }
+  if [[ ${o##*:} == 8009 ]]; then echo chromecast; else echo dlna; fi
+}
+
+# url_hostport <url>: prints "<ip> <port>" (IPv6 without brackets).
+url_hostport() {
+  local o host
+  o=$(url_origin "$1") || return 1
+  host=${o#*://}
+  host=${host%:*}
+  host=${host#\[}
+  printf '%s %s\n' "${host%\]}" "${o##*:}"
+}
+
+# reachable <url>: true if a LAN URL answers (a Chromecast: its TLS port accepts).
+reachable() {
+  lan_url "$1" || return 1
+  if [[ $(url_type "$1") == chromecast ]]; then
+    local host port
+    read -r host port < <(url_hostport "$1") || return 1
+    timeout 2 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null
+  else
+    "${CURL[@]}" -fsS -m 2 -o /dev/null "$1" 2>/dev/null
+  fi
+}
 
 soap() { # soap <action> [inner-xml]; prints the response body
   local action=$1 args=${2:-} ctl url
@@ -200,19 +233,104 @@ hms_to_s() { # 1:02:03(.000) -> seconds
 
 s_to_hms() { printf '%d:%02d:%02d\n' $(($1 / 3600)) $(($1 % 3600 / 60)) $(($1 % 60)); }
 
-transport_state() { soap GetTransportInfo | xpath_str "//*[local-name()='CurrentTransportState']"; }
+# ---------- Chromecast (experimental) ----------
+# The device is as untrusted as a DLNA one: LAN IPs only (checked here and in
+# the helper), a timeout, a memory cap (Cast frames declare their own length),
+# and at most 4 KiB of output.
+
+cast_ready() { [[ -x $CAST_HELPER ]] && "$CAST_HELPER" --check >/dev/null 2>&1; }
+
+cast_helper() { # cast_helper <device-url> status|pause|play|stop|seek <s>; exit 3: no pychromecast
+  local url=$1 host port
+  shift
+  lan_url "$url" || return 1
+  read -r host port < <(url_hostport "$url") || return 1
+  [[ -x $CAST_HELPER ]] || return 3
+  (
+    ulimit -v 1048576 2>/dev/null
+    exec timeout 15 "$CAST_HELPER" "$host" "$port" "$@"
+  ) 2>/dev/null | head -c 4096
+}
+
+# cc_status: "<STATE> <pos> <dur>" for the active Chromecast. The runner polls
+# the device and caches the answer, so the bar's status calls reuse it.
+cc_status() {
+  local ctl line="" age
+  if [[ -z ${TVCAST_IN_RUNNER:-} && -s $CC_STATUS_FILE ]]; then
+    age=$(($(date +%s) - $(stat -c %Y "$CC_STATUS_FILE" 2>/dev/null || echo 0)))
+    ((age <= 5)) && line=$(head -c 200 "$CC_STATUS_FILE")
+  fi
+  if [[ -z $line ]]; then
+    ctl=$(state_get control)
+    [[ -n $ctl ]] || return 1
+    line=$(cast_helper "$ctl" status) || return 1
+    [[ -n ${TVCAST_IN_RUNNER:-} ]] && printf '%s\n' "$line" >"$CC_STATUS_FILE"
+  fi
+  local st pos dur
+  read -r st pos dur <<<"$line"
+  [[ $st =~ ^[A-Z_]{1,32}$ ]] || return 1
+  printf '%s %s %s\n' "$st" "$(uint "$pos")" "$(uint "$dur")"
+}
+
+# active_type: backend of what is casting now (state written by the runner).
+active_type() { if [[ $(state_get type) == chromecast ]]; then echo chromecast; else echo dlna; fi; }
+
+transport_state() {
+  if [[ $(active_type) == chromecast ]]; then
+    local st _
+    read -r st _ < <(cc_status) || return 1
+    printf '%s\n' "$st"
+    return
+  fi
+  soap GetTransportInfo | xpath_str "//*[local-name()='CurrentTransportState']"
+}
 
 position_info() { # prints "<pos-seconds> <duration-seconds>"
   local xml
+  if [[ $(active_type) == chromecast ]]; then
+    local _ pos dur
+    read -r _ pos dur < <(cc_status) || return 1
+    echo "$pos $dur"
+    return
+  fi
   xml=$(soap GetPositionInfo) || return 1
   echo "$(hms_to_s "$(xpath_str "//*[local-name()='RelTime']" <<<"$xml")") $(hms_to_s "$(xpath_str "//*[local-name()='TrackDuration']" <<<"$xml")")"
 }
 
+# dev_status: "<STATE> <pos> <dur>" in one go (one device query on Chromecast).
+dev_status() {
+  local st pos=0 dur=0
+  if [[ $(active_type) == chromecast ]]; then cc_status; return; fi
+  st=$(transport_state 2>/dev/null)
+  read -r pos dur < <(position_info 2>/dev/null) || true
+  printf '%s %s %s\n' "${st:-UNKNOWN}" "${pos:-0}" "${dur:-0}"
+}
+
+# dev_control pause|play|stop|seek <secs>: send a transport command to the
+# active device, whatever its type.
+dev_control() {
+  if [[ $(active_type) == chromecast ]]; then
+    local ctl rc=0
+    ctl=$(state_get control)
+    [[ -n $ctl ]] || { echo "tvcast: nothing is casting" >&2; return 1; }
+    cast_helper "$ctl" "$@" >/dev/null || rc=$?
+    ((rc == 3)) && notify normal "Cast to TV" "$PYCHROMECAST_HINT"
+    return "$rc"
+  fi
+  case $1 in
+    pause) soap Pause >/dev/null ;;
+    play) soap Play '<Speed>1</Speed>' >/dev/null ;;
+    stop) soap Stop >/dev/null ;;
+    seek) soap Seek "<Unit>REL_TIME</Unit><Target>$(s_to_hms "$(uint "$2")")</Target>" >/dev/null ;;
+    *) return 2 ;;
+  esac
+}
+
 # ---------- discovery ----------
 
-# discover: prints "name<TAB>url" per device. go2tv -l scans until killed and
-# needs a terminal, so it runs under script(1); we stop a few seconds after the
-# first device shows up, or after TVCAST_SCAN_SECONDS (default 20).
+# discover: prints "name<TAB>url<TAB>type" per device (dlna|chromecast).
+# go2tv -l scans until killed and needs a terminal, so it runs under script(1);
+# we stop a few seconds after the first device shows up, or after TVCAST_SCAN_SECONDS (default 20).
 discover() {
   local out pid max=${TVCAST_SCAN_SECONDS:-20} waited=0 first=0
   out=$(mktemp "$CACHE_DIR/scan.XXXXXX")
@@ -230,8 +348,14 @@ discover() {
   kill -TERM -- "-$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
   sed -E 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/\x1b\][^\x1b]*\x1b\\//g; s/\x1b[=>]//g' "$out" | tr '\r' '\n' |
-    sed -nE 's/^[^[:alnum:]]*(.*[^ ]) +(DLNA) +\[(http[^]]+)\].*$/\1\t\3/p' | sort -u |
-    while IFS=$'\t' read -r name url; do lan_url "$url" && printf '%s\t%s\n' "$name" "$url"; done
+    sed -nE 's/^[^[:alnum:]]*(.*[^ ]) +(DLNA|Chromecast) +\[(http[^]]+)\].*$/\1\t\3\t\2/p' | sort -u |
+    while IFS=$'\t' read -r name url tag; do
+      lan_url "$url" || continue
+      # go2tv routes -t by port alone, so skip anything it would misroute
+      # (Chromecast groups on other ports, a DLNA device on 8009).
+      [[ ${tag,,} == "$(url_type "$url")" ]] || continue
+      printf '%s\t%s\t%s\n' "$name" "$url" "${tag,,}"
+    done
   rm -f "$out"
 }
 
@@ -239,7 +363,7 @@ cmd_devices() {
   local list
   list=$(discover)
   if [[ ${1:-} == --json ]]; then
-    jq -Rn '[inputs | split("\t") | select(length == 2) | {name: .[0], url: .[1]}]' <<<"$list"
+    jq -Rn '[inputs | split("\t") | select(length == 3) | {name: .[0], url: .[1], type: .[2]}]' <<<"$list"
   else
     [[ -n $list ]] && printf '%s\n' "$list"
   fi
@@ -254,8 +378,8 @@ url_host() {
   printf '%s\n' "${o%:*}"
 }
 
-# choose_device [--pick]: prints "name<TAB>url". Reuses the cached TV when it
-# answers, unless --pick. A newly discovered device is never trusted on its
+# choose_device [--pick]: prints "name<TAB>url" (the type follows from the URL).
+# Reuses the cached TV when it answers, unless --pick. A newly discovered device is never trusted on its
 # own: without --pick, discovery only auto-selects a device at the exact
 # description URL we already know; anything else (a single new device included)
 # goes through the menu, which shows each device's IP address.
@@ -277,15 +401,17 @@ choose_device() {
 
   choice=""
   if [[ -z $pick && -n $known ]]; then
-    while IFS=$'\t' read -r name url; do
+    while IFS=$'\t' read -r name url _; do
       [[ $url == "$known" ]] && { choice=$name$'\t'$url; break; }
     done <<<"$list"
   fi
 
   if [[ -z $choice ]]; then
     local options=() selected=() picked
-    while IFS=$'\t' read -r name url; do
-      label="$name  ($(url_host "$url"))"
+    local type
+    while IFS=$'\t' read -r name url type; do
+      if [[ $type == chromecast ]]; then type=Chromecast; else type=DLNA; fi
+      label="$name  ($(url_host "$url"), $type)"
       options+=("󰔂"$'\t'"$label"$'\t'"$url")
       [[ $url == "$known" ]] && selected=(--selected "$label"$'\t'"$url")
     done <<<"$list"
@@ -293,7 +419,7 @@ choose_device() {
     [[ -n $picked ]] || return 2
     # The menu returns "label<TAB>url"; map the URL back to the device's name.
     url=${picked##*$'\t'}
-    while IFS=$'\t' read -r name label; do
+    while IFS=$'\t' read -r name label _; do
       [[ $label == "$url" ]] && { choice=$name$'\t'$label; break; }
     done <<<"$list"
     [[ -n $choice ]] || return 2
@@ -396,7 +522,7 @@ items_json() { # items_json <file...>: JSON array of queue items, skipping non-f
 
 # ensure_device [--pick]: make sure the queue names a reachable TV.
 ensure_device() {
-  local pick=${1:-} url dev name ctl
+  local pick=${1:-} url dev name ctl type
   url=$(q_get '.device.url // empty')
   if [[ -z $pick && -n $url ]] && reachable "$url"; then
     return 0
@@ -409,16 +535,24 @@ ensure_device() {
   esac
   name=${dev%%$'\t'*}
   url=${dev#*$'\t'}
-  ctl=$(control_url "$url") || die "$name does not offer DLNA playback control."
-  q_update --arg name "$name" --arg url "$url" --arg control "$ctl" \
-    '.device = {name: $name, url: $url, control: $control}'
+  type=$(url_type "$url")
+  if [[ $type == chromecast ]]; then
+    # A Chromecast is controlled at its own cast address, there's no description.
+    ctl=$url
+    cast_ready || notify normal "Cast to TV" "$PYCHROMECAST_HINT Casting without them."
+  else
+    ctl=$(control_url "$url") || die "$name does not offer DLNA playback control."
+  fi
+  q_update --arg name "$name" --arg url "$url" --arg control "$ctl" --arg type "$type" \
+    '.device = {name: $name, url: $url, control: $control, type: $type}'
 }
 
 start_runner() {
   local env=(--setenv=TERM=xterm-256color --setenv="XDG_CACHE_HOME=${XDG_CACHE_HOME:-$HOME/.cache}"
     --setenv="XDG_STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}" --setenv="TVCAST_GO2TV=$GO2TV")
   local v
-  for v in TVCAST_QUIET TVCAST_TRANSCODE TVCAST_IMAGE_SECONDS TVCAST_POLL_SECONDS TVCAST_START_TIMEOUT; do
+  for v in TVCAST_QUIET TVCAST_TRANSCODE TVCAST_IMAGE_SECONDS TVCAST_POLL_SECONDS TVCAST_START_TIMEOUT \
+    TVCAST_CAST_HELPER TVCAST_ALLOW_LOOPBACK; do
     [[ -n ${!v:-} ]] && env+=(--setenv="$v=${!v}")
   done
   systemctl --user reset-failed "$UNIT" 2>/dev/null
@@ -459,23 +593,30 @@ kill_player() {
 
 nap() { sleep "$1" & wait $!; } # interruptible by the TERM trap
 
-# wait_item_end <kind> <is-last>: 0 when the item finished, 1 when it never
-# started. "Finished" is seen on the TV, not from go2tv: STOPPED or
+# wait_item_end <kind> <is-last> [blind]: 0 when the item finished, 1 when it
+# never started. "Finished" is seen on the device, not from go2tv: STOPPED or
 # NO_MEDIA_PRESENT after it was PLAYING, or position reaching duration, on two
-# polls in a row. Images advance after TVCAST_IMAGE_SECONDS unless last.
+# polls in a row. On Chromecast go2tv also exits by itself at the end, which
+# counts once playback was seen. "blind" (a Chromecast without pychromecast)
+# has no status at all: go2tv exiting after 10 s or more counts as finished.
+# Images advance after TVCAST_IMAGE_SECONDS unless last.
 wait_item_end() {
-  local kind=$1 last=$2 saw=0 ends=0 t=0 st pos dur at_end
+  local kind=$1 last=$2 blind=${3:-} saw=0 ends=0 t=0 st pos dur at_end
   local poll=${TVCAST_POLL_SECONDS:-2} start_timeout=${TVCAST_START_TIMEOUT:-90}
   while :; do
     nap "$poll"
     t=$((t + poll))
     if ! kill -0 "$PLAYER_PID" 2>/dev/null; then
       ((saw)) && return 0
+      [[ -n $blind ]] && ((t >= 10)) && return 0
       return 1
     fi
-    st=$(transport_state 2>/dev/null)
-    pos=0 dur=0
-    read -r pos dur < <(position_info 2>/dev/null) || true
+    if [[ -n $blind ]]; then
+      [[ $kind == image ]] && ((!last && t >= ${TVCAST_IMAGE_SECONDS:-10})) && return 0
+      continue
+    fi
+    st="" pos=0 dur=0
+    read -r st pos dur < <(dev_status 2>/dev/null) || true
     at_end=0
     case $st in
       PLAYING | PAUSED_PLAYBACK) saw=1 ;;
@@ -493,7 +634,8 @@ wait_item_end() {
 
 cmd_run() {
   trap 'kill_player; exit 0' TERM INT
-  local q count idx item file title kind subs tc args name url ctl last
+  local q count idx item file title kind subs tc args name url ctl last type blind=""
+  export TVCAST_IN_RUNNER=1
   while :; do
     q=$(q_read)
     count=$(uint "$(jq '.items | length' <<<"$q")")
@@ -511,6 +653,13 @@ cmd_run() {
     url=$(jq -r '.device.url // empty' <<<"$q")
     ctl=$(jq -r '.device.control // empty' <<<"$q")
     [[ -n $url && -n $ctl ]] || die "No TV selected."
+    type=$(url_type "$url")
+    if [[ $type == chromecast && -z $blind ]] && ! cast_ready; then
+      blind=1
+      notify normal "Cast to TV" "$PYCHROMECAST_HINT Casting without them."
+    fi
+    [[ $type == chromecast ]] || blind=""
+    rm -f "$CC_STATUS_FILE"
 
     if [[ ! -f $file ]]; then
       notify normal "Cast to TV" "Skipping missing file: $title"
@@ -523,15 +672,22 @@ cmd_run() {
     if [[ $kind == video ]]; then
       subs=$(subtitle_for "$file")
       [[ -n $subs ]] && args+=(-s "$subs")
-      needs_transcode "$file" && { args+=(-tc); tc=1; }
+      # go2tv picks Chromecast transcoding itself; the codec lists here are
+      # for DLNA TVs, so on a Chromecast only TVCAST_TRANSCODE=always forces it.
+      if [[ $type == chromecast ]]; then
+        [[ ${TVCAST_TRANSCODE:-} == always ]] && { args+=(-tc); tc=1; }
+      elif needs_transcode "$file"; then
+        args+=(-tc)
+        tc=1
+      fi
     fi
     last=$((idx + 1 >= count ? 1 : 0))
 
     write_state "$(jq -cn --arg title "$title" --arg file "$file" --arg kind "$kind" \
-      --arg device "$url" --arg name "$name" --arg control "$ctl" --arg subs "$subs" \
+      --arg device "$url" --arg name "$name" --arg control "$ctl" --arg subs "$subs" --arg type "$type" \
       --argjson transcode "$tc" --argjson started "$(date +%s)" --argjson index "$idx" --argjson count "$count" \
       '{active: true, title: $title, file: $file, kind: $kind, device: $device, deviceName: $name,
-        control: $control, subtitles: $subs, transcode: ($transcode == 1), started: $started,
+        type: $type, control: $control, subtitles: $subs, transcode: ($transcode == 1), started: $started,
         index: $index, count: $count}')"
     if ((count > 1)); then
       notify low "Casting $((idx + 1))/$count to $name" "$title"
@@ -542,7 +698,7 @@ cmd_run() {
     SHELL=/bin/bash setsid script -qfec "$(printf '%q ' "$GO2TV" "${args[@]}")" "$LOG_FILE" </dev/null >/dev/null 2>&1 &
     PLAYER_PID=$!
 
-    if ! wait_item_end "$kind" "$last"; then
+    if ! wait_item_end "$kind" "$last" "$blind"; then
       notify normal "Cast to TV" "Couldn't play $title, skipping. See $LOG_FILE"
     fi
     kill_player
@@ -669,20 +825,21 @@ cmd_clear() {
 }
 
 cmd_cleanup() { # ExecStopPost: tell the TV to stop, mark idle
-  [[ $(state_get active) == true ]] && soap Stop >/dev/null 2>&1
+  [[ $(state_get active) == true ]] && dev_control stop >/dev/null 2>&1
   write_state '{"active":false}'
+  rm -f "$CC_STATUS_FILE"
 }
 
 cmd_stop() { # stop playback, keep the queue (play resumes at the same item)
   # Stop the service first so its poller can't mistake the TV's STOPPED for
   # the end of the file and advance; its ExecStopPost sends the TV Stop.
   stop_runner
-  [[ $(state_get active) == true ]] && { soap Stop >/dev/null 2>&1; write_state '{"active":false}'; }
+  [[ $(state_get active) == true ]] && { dev_control stop >/dev/null 2>&1; write_state '{"active":false}'; }
   return 0
 }
 
-cmd_pause() { soap Pause >/dev/null; }
-cmd_resume() { soap Play '<Speed>1</Speed>' >/dev/null; }
+cmd_pause() { dev_control pause; }
+cmd_resume() { dev_control play; }
 
 cmd_play() { # resume, or start the queue when idle
   if is_active; then cmd_resume; else play_at "$(q_index)"; fi
@@ -706,8 +863,11 @@ cmd_seek() {
     arg=$(s_to_hms "$target")
   elif [[ $arg =~ ^[0-9]+$ ]]; then
     arg=$(s_to_hms "$arg")
+  elif ! [[ $arg =~ ^[0-9]{1,6}:[0-9]{1,2}:[0-9]{1,2}$ ]]; then
+    echo "usage: tvcast seek <+N|-N|secs|hh:mm:ss>" >&2
+    return 2
   fi
-  soap Seek "<Unit>REL_TIME</Unit><Target>$arg</Target>" >/dev/null
+  dev_control seek "$(hms_to_s "$arg")"
 }
 
 # seek-to: absolute seek in seconds, clamped to the track (the panel's slider).
@@ -718,7 +878,7 @@ cmd_seek_to() {
   read -r pos dur < <(position_info) || die "The TV did not report a position."
   ((dur > 0)) || die "The TV reports no duration for this item, so it can't seek."
   ((target > dur - 1)) && target=$((dur - 1))
-  soap Seek "<Unit>REL_TIME</Unit><Target>$(s_to_hms "$target")</Target>" >/dev/null || die "The TV refused the seek."
+  dev_control seek "$target" || die "The TV refused the seek."
 }
 
 # list: queue plus now-playing, no network calls. status --json adds the TV's
@@ -734,6 +894,7 @@ cmd_list() {
     index: (.index // 0),
     count: (.items | length),
     deviceName: (.device.name // $last),
+    deviceType: ($st.type // .device.type // ""),
     title: ($st.title // (.items[.index // 0].title // "")),
     kind: ($st.kind // ""),
     transcode: ($st.transcode // false),
@@ -745,8 +906,12 @@ cmd_status() {
   local json=${1:-} st="" pos=0 dur=0 list
   list=$(cmd_list)
   if [[ $(jq -r .active <<<"$list") == true ]]; then
-    st=$(transport_state 2>/dev/null)
-    read -r pos dur < <(position_info 2>/dev/null) || true
+    if [[ $(active_type) == chromecast ]]; then
+      read -r st pos dur < <(cc_status 2>/dev/null) || true
+    else
+      st=$(transport_state 2>/dev/null)
+      read -r pos dur < <(position_info 2>/dev/null) || true
+    fi
   fi
   if [[ $json == --json ]]; then
     jq -c --arg st "$st" --argjson pos "${pos:-0}" --argjson dur "${dur:-0}" \
@@ -788,6 +953,6 @@ case ${1:-cast} in
   has-queue) (($(q_count) >= $(uint "${2:-1}"))) ;;
   _run) cmd_run ;;
   _cleanup) cmd_cleanup ;;
-  -h | --help | help) sed -n '3,26p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  -h | --help | help) sed -n '3,29p' "$SELF" | sed 's/^# \{0,1\}//' ;;
   *) echo "tvcast: unknown command '$1' (try tvcast help)" >&2; exit 2 ;;
 esac

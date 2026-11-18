@@ -59,3 +59,28 @@
   (and `HOME`) in the same shell before running any `tvcast` command, including `_run`.
   A real cast may be running, and its queue lives in the default dirs (a test run once
   cleared the user's live queue because the exports were missing from that shell).
+
+## Backends (DLNA and Chromecast)
+
+- **Every queue device has a `type`** (`dlna` or `chromecast`), and the runner writes it
+  into state.json. The type always comes from `url_type` (port 8009 means Chromecast),
+  the same rule go2tv uses to route `-t`. Discovery drops entries where go2tv's tag and
+  `url_type` disagree (Chromecast groups on other ports), so the two never diverge.
+- **Transport calls go through the dispatchers:** `dev_status`, `transport_state`,
+  `position_info` and `dev_control pause|play|stop|seek <secs>`. Don't call `soap`
+  directly from commands. DLNA behaviour must stay byte-for-byte the same: compare the
+  SOAP log of `pause, resume, seek-to, seek ±N, seek h:mm:ss, toggle, stop` against the
+  previous release with a fake TV.
+- **Chromecast control is `bin/tvcast-chromecast` (python-pychromecast, optional).** Call it
+  only through `cast_helper`, which enforces a LAN IP, `timeout`, `ulimit -v` (Cast frames
+  declare their own length) and a 4 KiB output cap. The helper must never launch an app on
+  the device: it only joins a session that is already running. Missing pychromecast
+  (exit 3) is a notification, never a failure: the runner falls back to go2tv's exit as
+  the end-of-file signal.
+- **The runner caches Chromecast status** in `~/.cache/tvcast/chromecast-status`, so the
+  bar's 2 s polls don't each open a Cast connection.
+- **Test Chromecast with a fake Cast v2 server on 127.0.0.1:8009** (TLS, protobuf
+  `CastMessage` from pychromecast in a throwaway venv) plus the real go2tv, which talks to
+  it. Run `_run` with `TERM=xterm-256color` (the unit sets it; go2tv's Chromecast screen
+  needs it). go2tv 2.x launches its own receiver app (`C2568A1A`), not Google's default one.
+

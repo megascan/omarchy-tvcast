@@ -1,9 +1,10 @@
 # TV Cast for Omarchy
 
-Cast local video, audio and image files to a DLNA smart TV from Omarchy, as a
-play queue you manage from the top bar. Files are served by
-[go2tv](https://github.com/alexballas/go2tv). Pause, seek, stop and the queue's
-auto-advance go straight to the TV over UPnP AVTransport.
+Cast local video, audio and image files to a DLNA smart TV or a Chromecast
+(experimental) from Omarchy, as a play queue you manage from the top bar. Files
+are served by [go2tv](https://github.com/alexballas/go2tv). Pause, seek, stop and
+the queue's auto-advance go straight to the TV over UPnP AVTransport, or over the
+Cast protocol for a Chromecast.
 
 ![Queue panel](preview.png)
 
@@ -18,9 +19,12 @@ auto-advance go straight to the TV over UPnP AVTransport.
   - Middle-click pauses or resumes, right-click stops, and scrolling seeks 30 s.
 - **Queue:** moves to the next file when the TV reports the current one finished.
   Stopping it yourself never skips ahead, and the queue clears itself once the last file ends.
-- **Format check:** ffprobe decides whether a video needs transcoding. H.264, HEVC,
+- **DLNA and Chromecast:** the TV picker lists both, with each device's IP address
+  and type. A device you haven't picked before is never chosen for you.
+- **Format check (DLNA):** ffprobe decides whether a video needs transcoding. H.264, HEVC,
   MPEG-2 and MPEG-4 video in MP4, MKV, MOV, TS or AVI with AAC, AC3, EAC3 or MP3
   audio plays as-is. Everything else gets go2tv's ffmpeg transcode (`-tc`).
+  On a Chromecast, go2tv makes that call itself.
 - **Subtitles:** a sidecar with the same name (`movie.srt`, `movie.en.srt`, `.vtt`,
   `.ass`, `.ssa`) is sent along automatically.
 - **Images** stay on screen for 10 s (`TVCAST_IMAGE_SECONDS`), or until you stop if
@@ -38,8 +42,23 @@ auto-advance go straight to the TV over UPnP AVTransport.
 - `ffmpeg`/`ffprobe`, `jq`, `curl`, `libxml2` (`xmllint`) and `util-linux` (`script`).
   Omarchy ships all of these.
 - A **DLNA/UPnP media renderer**, which most smart TVs are (LG webOS, Samsung,
-  Sony, Philips and so on). Chromecast isn't supported yet: go2tv can cast to it,
-  but this plugin's controls and queue use DLNA AVTransport.
+  Sony, Philips and so on), or a **Chromecast** / Google TV (see below).
+
+### Chromecast (experimental)
+
+go2tv casts to Chromecasts by itself. To pause, seek, show progress and move
+through the queue reliably, tvcast also needs one optional package, only if you
+use a Chromecast:
+
+```sh
+sudo pacman -S python-pychromecast
+```
+
+Without it, files still play and the queue still advances when go2tv sees the
+end of a file, but pause, seek and the progress bar don't work, and tvcast tells
+you so in a notification. Known limits: this has been tested against a simulated
+Chromecast only, not real hardware. Seeking in a file go2tv transcodes for the
+Chromecast may not work, and Chromecast groups (speaker groups) aren't listed.
 
 ### Firewall
 
@@ -52,6 +71,14 @@ sudo ufw allow from <your-LAN>/24 to any port 3500:4499 proto tcp   # go2tv medi
 sudo ufw allow from <your-LAN>/24 to any port 3339:3438 proto udp   # go2tv discovery replies
 sudo ufw allow from <your-LAN>/24 to any port 1900 proto udp        # SSDP
 sudo ufw allow from <your-LAN>/24 to any port 5353 proto udp        # mDNS
+```
+
+A Chromecast needs the same media server ports and mDNS (5353/udp) to be
+found. Scoped to the device:
+
+```sh
+sudo ufw allow from <Chromecast-IP> to any port 3500:4499 proto tcp  # go2tv media server
+sudo ufw allow from <your-LAN>/24 to any port 5353 proto udp         # mDNS discovery
 ```
 
 Tighter, if your TV has a fixed address (a DHCP reservation in your router):
@@ -103,6 +130,8 @@ it with `systemctl --user stop tvcast`. State lives in `~/.local/state/tvcast/`
 Network safety: tvcast only talks to TVs on private LAN IP addresses (10/8, 172.16/12,
 192.168/16, link-local, IPv6 ULA), never follows redirects, and only sends playback
 commands to the same address and port that served the TV's device description.
+Chromecast commands go only to the cast port of the address you picked, and the
+helper runs under a timeout and a memory limit.
 `TVCAST_ALLOW_LOOPBACK=1` also allows 127.0.0.1, for testing against a fake TV.
 
 ## Uninstall

@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "megascan.tvcast",
   "name": "TV Cast",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "author": "megascan",
   "license": "MIT",
-  "description": "Cast local video, audio and image files to a DLNA smart TV as a play queue, managed from the bar. Uses go2tv.",
+  "description": "Cast local video, audio and image files to DLNA and Chromecast TVs as a play queue, managed from the bar. Uses go2tv.",
   "kinds": [
     "bar-widget"
   ],
