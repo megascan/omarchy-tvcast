@@ -30,3 +30,8 @@
 
 - `bin/tvcast` must pass `shellcheck`. The jq filters are single-quoted on purpose (SC2016 is off).
 - A user stop must never advance the queue: stop the service before telling the TV to stop.
+- **Launch the CLI from QML as an argv list, never as a re-quoted or "sanitised" shell string.**
+  Version 0.2.0 stripped every character except `[A-Za-z0-9+:._-]` from each argument.
+  That removed the `/` from the CLI's absolute path, so every click silently did nothing.
+  To check a change, click each action in the live shell and confirm what it does:
+  a picker window opens, a notification appears, or the queue state changes.

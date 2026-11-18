@@ -90,10 +90,11 @@ BarWidget {
 
   function refresh() { if (!statusProcess.running) statusProcess.running = true }
 
-  // Fixed words and integers only; nothing user-controlled reaches the shell.
+  // Runs the bundled CLI as an argv vector through a login shell (for the
+  // session PATH), so nothing is re-tokenized: the arguments are fixed words
+  // and integers anyway.
   function run(args) {
-    if (!root.bar) return
-    root.bar.run([root.tvcast].concat(args).map(function(a) { return "'" + String(a).replace(/[^A-Za-z0-9+:._-]/g, "") + "'" }).join(" "))
+    Quickshell.execDetached(["bash", "-lc", 'exec "$@"', "bash", root.tvcast].concat(args.map(String)))
     refreshSoon.restart()
   }
 
