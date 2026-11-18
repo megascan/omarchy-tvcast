@@ -37,7 +37,8 @@ Cast protocol for a Chromecast.
 ## Requirements
 
 - Omarchy with the Quickshell bar (Quattro or later).
-- [go2tv](https://github.com/alexballas/go2tv/releases): put the `go2tv` binary on
+- [go2tv](https://github.com/alexballas/go2tv/releases) **2.5.0 or newer** (older versions follow
+  whatever control URL a device advertises; tvcast refuses them): put the `go2tv` binary on
   your `PATH` or in `~/.local/bin`, or install the AUR package `go2tv`.
 - `ffmpeg`/`ffprobe`, `jq`, `curl`, `libxml2` (`xmllint`) and `util-linux` (`script`).
   Omarchy ships all of these.

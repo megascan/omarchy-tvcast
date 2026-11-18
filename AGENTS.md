@@ -90,3 +90,7 @@
 - **A fake HOME/XDG does not sandbox systemd.** `systemctl --user` talks to the real user
   manager through `XDG_RUNTIME_DIR`. `uninstall.sh` and `tvcast stop/clear` will stop the
   user's live cast. Put stub `systemctl`/`systemd-run` first on PATH before running them in tests.
+- **go2tv must be >= 2.5.0** (`require_go2tv`, `GO2TV_MIN`). go2tv re-fetches the device
+  description itself, so our origin checks only hold if go2tv pins endpoints too
+  (`validateServiceEndpoints`, added in 2.5.0). Raise `GO2TV_MIN` if a later go2tv fixes
+  another device-trust bug. Test stubs for go2tv must answer `-version`.

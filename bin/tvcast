@@ -83,6 +83,19 @@ die() {
 
 is_active() { systemctl --user -q is-active "$UNIT"; }
 
+# go2tv before 2.5.0 re-fetches the device description and follows whatever
+# controlURL/URLBase the device advertises, bypassing our origin checks.
+# 2.5.0 added its own endpoint pinning (validateServiceEndpoints).
+GO2TV_MIN=2.5.0
+require_go2tv() {
+  [[ -x $GO2TV ]] || die "go2tv is not installed (expected $GO2TV)."
+  local v
+  v=$("$GO2TV" -version 2>/dev/null </dev/null | sed -nE 's/.*[Vv]ersion:? *v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)
+  [[ -n $v ]] || die "Could not read the go2tv version; tvcast needs go2tv $GO2TV_MIN or newer."
+  [[ $(printf '%s\n%s\n' "$GO2TV_MIN" "$v" | sort -V | head -n1) == "$GO2TV_MIN" ]] ||
+    die "go2tv $v is too old; tvcast needs $GO2TV_MIN or newer (older versions don't pin TV control URLs)."
+}
+
 # ---------- state ----------
 
 write_state() { # write_state <json>; written in place so the bar's file watch fires
@@ -332,6 +345,7 @@ dev_control() {
 # go2tv -l scans until killed and needs a terminal, so it runs under script(1);
 # we stop a few seconds after the first device shows up, or after TVCAST_SCAN_SECONDS (default 20).
 discover() {
+  require_go2tv
   local out pid max=${TVCAST_SCAN_SECONDS:-20} waited=0 first=0
   out=$(mktemp "$CACHE_DIR/scan.XXXXXX")
   SHELL=/bin/bash TERM=xterm-256color setsid script -qfc "$(printf '%q -l' "$GO2TV")" "$out" </dev/null >/dev/null 2>&1 &
@@ -730,7 +744,7 @@ parse_pick() { # sets PICK and FILES from "[--pick] [file...]"
 cmd_cast() { # replace the queue with these files and play from the first
   local items
   parse_pick "$@"
-  [[ -x $GO2TV ]] || die "go2tv is not installed (expected $GO2TV)."
+  require_go2tv
   ((${#FILES[@]})) || readarray -t FILES < <(pick_files "Cast to TV")
   ((${#FILES[@]})) || exit 0
   items=$(items_json "${FILES[@]}")
@@ -755,7 +769,7 @@ cmd_add() { # append; starts playing only when nothing is queued or playing
     q_update --argjson items "$items" '.items += $items'
   fi
   if ! is_active && ((before == 0)); then
-    [[ -x $GO2TV ]] || die "go2tv is not installed (expected $GO2TV)."
+    require_go2tv
     ensure_device "$PICK" || exit 0
     start_runner
   else
