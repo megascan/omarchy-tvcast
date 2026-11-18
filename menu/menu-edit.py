@@ -85,18 +85,48 @@ def write_atomic(path, text, mode=None):
 
 
 def load_owned(path):
+    """Record: {"files": {real menu path: [exact lines tvcast added there]}}."""
     try:
         with open(path) as f:
             data = json.load(f)
-        return set(x for x in data.get("lines", []) if isinstance(x, str))
-    except (FileNotFoundError, ValueError, AttributeError):
-        return set()
+    except FileNotFoundError:
+        return {}
+    except ValueError:
+        sys.exit(f"{path} is not valid JSON; fix or remove it, then run this again")
+    if not isinstance(data, dict):
+        return {}
+    files = data.get("files")
+    if not isinstance(files, dict) and isinstance(data.get("menu"), str):
+        files = {data["menu"]: data.get("lines", [])}
+    out = {}
+    for menu, lines in (files or {}).items():
+        if isinstance(menu, str) and isinstance(lines, list):
+            out[menu] = [l for l in lines if isinstance(l, str)]
+    return out
+
+
+def save_owned(path, files):
+    files = {k: v for k, v in files.items() if v}
+    if files:
+        write_atomic(path, json.dumps({"files": files}, indent=1) + "\n", 0o600)
+    elif os.path.exists(path):
+        os.unlink(path)
+
+
+def backup(path):
+    real = os.path.realpath(path)
+    fd, bak = tempfile.mkstemp(prefix=os.path.basename(real) + ".bak.", dir=os.path.dirname(real))
+    with os.fdopen(fd, "w") as f, open(real) as src:
+        f.write(src.read())
+    return bak
 
 
 def install(menu, snippet, owned_path):
     lines = read_lines(menu)
     snip = [l for l in open(snippet).read().split("\n") if l.strip()]
-    owned = load_owned(owned_path) | set(snip)
+    real = os.path.realpath(menu)
+    record = load_owned(owned_path)
+    owned = set(record.get(real, [])) | set(snip)
     kept = [l for l in lines if l not in owned]
     text = "\n".join(kept)
     before = omarchy_items(text)
@@ -125,29 +155,44 @@ def install(menu, snippet, owned_path):
     if after is None or not want <= after.keys() or any(after.get(k) != v for k, v in before.items()):
         print(f"could not add tvcast's entries where Omarchy reads them in {menu}; menu left unchanged", file=sys.stderr)
         return 1
-    write_atomic(owned_path, json.dumps({"menu": os.path.realpath(menu), "lines": sorted(load_owned(owned_path) | set(add))}, indent=1) + "\n", 0o600)
+    record[real] = sorted(set(record.get(real, [])) | set(add))
+    save_owned(owned_path, record)
     write_atomic(menu, out)
-    write_atomic(owned_path, json.dumps({"menu": os.path.realpath(menu), "lines": add}, indent=1) + "\n", 0o600)
+    record[real] = add
+    save_owned(owned_path, record)
     for k in skipped:
         print(f'kept your own "{k}" entry; tvcast did not add its version', file=sys.stderr)
     return 0
 
 
-def uninstall(menu, owned_path):
-    owned = load_owned(owned_path)
-    lines = read_lines(menu)
-    if not owned or lines is None:
-        return 0
-    kept = [l for l in lines if l not in owned]
-    if len(kept) != len(lines):
-        out = "\n".join(kept)
-        if omarchy_items("\n".join(lines)) is not None and omarchy_items(out) is None:
-            print(f"removing tvcast's entries would break {menu}; left it and the ownership record as they are", file=sys.stderr)
-            return 1
-        write_atomic(menu, out)
-        print("removed tvcast's menu entries (backup saved)")
-    os.unlink(owned_path)
-    return 0
+def uninstall(owned_path):
+    record = load_owned(owned_path)
+    failed = False
+    for real in sorted(record):
+        owned = set(record[real])
+        lines = read_lines(real)
+        if lines is None:
+            print(f"{real} no longer exists; kept the record of tvcast's lines in it ({owned_path})", file=sys.stderr)
+            failed = True
+            continue
+        kept = [l for l in lines if l not in owned]
+        if len(kept) != len(lines):
+            out = "\n".join(kept)
+            if omarchy_items("\n".join(lines)) is not None and omarchy_items(out) is None:
+                print(f"removing tvcast's entries would break {real}; left it and the record as they are", file=sys.stderr)
+                failed = True
+                continue
+            try:
+                bak = backup(real)
+                write_atomic(real, out)
+            except OSError as e:
+                print(f"could not clean {real}: {e}; kept the record so a rerun can finish", file=sys.stderr)
+                failed = True
+                continue
+            print(f"removed tvcast's menu entries from {real} (backup: {bak})")
+        del record[real]
+    save_owned(owned_path, record)
+    return 1 if failed else 0
 
 
 def main():
@@ -155,7 +200,7 @@ def main():
     if cmd == "install":
         sys.exit(install(sys.argv[2], sys.argv[3], sys.argv[4]))
     if cmd == "uninstall":
-        sys.exit(uninstall(sys.argv[2], sys.argv[3]))
+        sys.exit(uninstall(sys.argv[2]))
     sys.exit(f"unknown command {cmd}")
 
 

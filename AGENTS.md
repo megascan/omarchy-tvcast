@@ -143,8 +143,10 @@
   as soon as the menu opens. Temp and backup files are created fresh (`mkstemp`/`mktemp`),
   never at a fixed path that could already be a symlink.
   Menu edits go through `menu/menu-edit.py`. Ownership is the exact lines recorded in
-  `$XDG_STATE_HOME/tvcast/menu-owned.json` (plus lines byte-identical to the current
-  snippet). A user's own `trigger.cast` parent makes install add nothing; a user's own
+  `$XDG_STATE_HOME/tvcast/menu-owned.json`, keyed by the real (symlink-resolved) file
+  they were written to (plus lines byte-identical to the current snippet). Uninstall
+  cleans each recorded file, not whatever `~/.config/.../omarchy-menu.jsonc` points at
+  now, and keeps the entry for any file it could not clean. A user's own `trigger.cast` parent makes install add nothing; a user's own
   child key is kept and tvcast's skipped. Uninstall removes only recorded lines, and
   nothing if `--menu` was never run. Omarchy's JSONC parser only strips whole-line `//`
   comments, so never mark ownership with trailing comments. Entries go into the object

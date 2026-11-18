@@ -4,18 +4,16 @@
 set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 id=$(jq -r .id "$here/manifest.json")
-menu=$HOME/.config/omarchy/extensions/omarchy-menu.jsonc
 
 systemctl --user stop tvcast.service 2>/dev/null
 [[ $(readlink -f "$HOME/.local/bin/tvcast") == */"$id"/bin/tvcast ]] && rm -f "$HOME/.local/bin/tvcast"
 state=${XDG_STATE_HOME:-$HOME/.local/state}/tvcast
-# Only the exact lines install.sh recorded as its own; nothing if --menu was never used.
-if [[ -f $menu && -f $state/menu-owned.json ]]; then
-  if ! { bak=$(mktemp "$menu.bak.XXXXXX") && cp "$menu" "$bak" &&
-    python3 -I "$here/menu/menu-edit.py" uninstall "$menu" "$state/menu-owned.json"; }; then
-    echo "menu cleanup failed; kept $state/menu-owned.json so running this again can finish it" >&2
-    failed=1
-  fi
+# Only the exact lines install.sh recorded, in the file it recorded them for (even if
+# the menu symlink now points elsewhere); nothing if --menu was never used.
+if [[ -f $state/menu-owned.json ]] &&
+  ! python3 -I "$here/menu/menu-edit.py" uninstall "$state/menu-owned.json"; then
+  echo "menu cleanup incomplete; kept $state/menu-owned.json so running this again can finish it" >&2
+  failed=1
 fi
 rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/tvcast"
 # Keep plugin-backups/ (previous installs moved aside by install.sh).
