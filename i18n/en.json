@@ -1,0 +1,22 @@
+{
+  "tooltip.playing": "Casting %1 to %2\n%3\nClick: queue · Middle-click: pause · Right-click: stop · Scroll: seek",
+  "tooltip.paused": "Paused: %1 on %2\n%3\nClick: queue · Middle-click: resume · Right-click: stop · Scroll: seek",
+  "tooltip.stopped": "Stopped: %1 is next on %2\nClick: queue · Middle-click: play",
+  "panel.empty": "Nothing queued",
+  "panel.playing": "Playing on %1 · %2 of %3",
+  "panel.paused": "Paused on %1 · %2 of %3",
+  "panel.stopped": "Stopped · %2 of %3 queued for %1",
+  "panel.transcoding": "transcoding",
+  "button.previous": "Previous",
+  "button.next": "Next",
+  "button.back30": "Back 30 seconds",
+  "button.forward30": "Forward 30 seconds",
+  "button.play": "Play",
+  "button.pause": "Pause",
+  "button.stop": "Stop",
+  "button.moveUp": "Move up",
+  "button.moveDown": "Move down",
+  "button.remove": "Remove",
+  "button.add": "Add files…",
+  "button.clear": "Clear"
+}
