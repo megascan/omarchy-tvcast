@@ -8,14 +8,12 @@ menu=$HOME/.config/omarchy/extensions/omarchy-menu.jsonc
 
 systemctl --user stop tvcast.service 2>/dev/null
 [[ $(readlink -f "$HOME/.local/bin/tvcast") == */"$id"/bin/tvcast ]] && rm -f "$HOME/.local/bin/tvcast"
-# Only the lines install.sh added: a line starting with one of our keys, or our comment.
-ours='^[[:space:]]*("trigger\.cast(\.(file|add|other|play|toggle|next|prev|back|forward|volup|voldown|mute|status|stop|clear))?"[[:space:]]*:|// tvcast: )'
-if [[ -f $menu ]] && grep -qE "$ours" "$menu"; then
-  cp "$menu" "$(mktemp "$menu.bak.XXXXXX")"
-  sed -i --follow-symlinks -E "\\#$ours#d" "$menu"
-  echo "removed menu entries (backup saved)"
-fi
 state=${XDG_STATE_HOME:-$HOME/.local/state}/tvcast
+# Only the exact lines install.sh recorded as its own; nothing if --menu was never used.
+if [[ -f $menu && -f $state/menu-owned.json ]]; then
+  cp "$menu" "$(mktemp "$menu.bak.XXXXXX")"
+  python3 -I "$here/menu/menu-edit.py" uninstall "$menu" "$state/menu-owned.json"
+fi
 rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/tvcast"
 # Keep plugin-backups/ (previous installs moved aside by install.sh).
 find "$state" -mindepth 1 -maxdepth 1 ! -name plugin-backups -exec rm -rf {} + 2>/dev/null

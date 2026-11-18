@@ -142,12 +142,13 @@
   `$HOME/.config/omarchy/plugins/megascan.tvcast/bin/tvcast`, because `when` checks run
   as soon as the menu opens. Temp and backup files are created fresh (`mkstemp`/`mktemp`),
   never at a fixed path that could already be a symlink.
-  Menu edits (install and uninstall) touch only lines that *start* with one of the
-  snippet's exact keys, or the `// tvcast: ` comment. A user's `"trigger.castle"`, a
-  mention inside a string, or a one-line file are left alone. The menu is rewritten
-  atomically (temp file + rename, following a dotfiles symlink), and the install
-  aborts without a closing brace. Keep the key list in `install.sh`/`uninstall.sh` in step
-  with `menu/omarchy-menu.snippet.jsonc`.
+  Menu edits go through `menu/menu-edit.py`. Ownership is the exact lines recorded in
+  `$XDG_STATE_HOME/tvcast/menu-owned.json` (plus lines byte-identical to the current
+  snippet). A user's own `trigger.cast` parent makes install add nothing; a user's own
+  child key is kept and tvcast's skipped. Uninstall removes only recorded lines, and
+  nothing if `--menu` was never run. Omarchy's JSONC parser only strips whole-line `//`
+  comments, so never mark ownership with trailing comments. Writes are atomic via
+  `mkstemp` beside the real (symlink-resolved) file.
 - **By design, documented in the README:** go2tv's media server is unauthenticated
   HTTP on the TV-facing address while a file plays. The README's first firewall rule
   is scoped to the TV's IP. File paths appear in go2tv's argv (a same-basename symlink

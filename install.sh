@@ -48,32 +48,10 @@ if [[ ${1:-} == --menu ]]; then
   mkdir -p "$(dirname "$menu")"
   [[ -s $menu ]] || printf '{\n}\n' >"$menu"
   cp "$menu" "$(mktemp "$menu.bak.XXXXXX")"
-  python3 -I - "$menu" "$here/menu/omarchy-menu.snippet.jsonc" <<'PY'
-import os, re, sys, tempfile
-path, snip = sys.argv[1], sys.argv[2]
-# Only our own lines: a line that starts with one of the snippet's keys, or
-# the snippet's comment. Anything else (a "trigger.castle" entry, a one-line
-# file) is left exactly as it is.
-ours = re.compile(r'^\s*("trigger\.cast(\.(file|add|other|play|toggle|next|prev|back|forward|volup|voldown|mute|status|stop|clear))?"\s*:|// tvcast: )')
-text = "\n".join(l for l in open(path).read().split("\n") if not ours.match(l))
-end = text.rstrip().rfind("}")
-if end < 0:
-    sys.exit(f"{path} has no closing brace; menu left unchanged")
-head = text[:end].rstrip()
-if head and not head.endswith(("{", ",")):
-    head += ","
-real = os.path.realpath(path)  # a dotfiles symlink stays a symlink
-fd, tmp = tempfile.mkstemp(prefix=".tvcast.", dir=os.path.dirname(real))
-try:
-    with os.fdopen(fd, "w") as f:
-        f.write(head + "\n" + open(snip).read() + text[end:])
-    os.chmod(tmp, os.stat(real).st_mode & 0o7777)
-    os.replace(tmp, real)
-except BaseException:
-    os.unlink(tmp)
-    raise
-PY
-  echo "added menu entries (Trigger > Cast to TV); backup saved next to $menu"
+  state=${XDG_STATE_HOME:-$HOME/.local/state}/tvcast
+  (umask 077 && mkdir -p "$state")
+  python3 -I "$here/menu/menu-edit.py" install "$menu" "$here/menu/omarchy-menu.snippet.jsonc" "$state/menu-owned.json" &&
+    echo "added menu entries (Trigger > Cast to TV); backup saved next to $menu"
 fi
 
 command -v go2tv >/dev/null || [[ -x $HOME/.local/bin/go2tv ]] ||

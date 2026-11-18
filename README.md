@@ -105,8 +105,10 @@ omarchy plugin add https://github.com/megascan/omarchy-tvcast --enable
 `install.sh` links the `tvcast` CLI into `~/.local/bin`. If something else already
 uses that name, it leaves it alone and says so. `--menu` also adds the menu
 entries to `~/.config/omarchy/extensions/omarchy-menu.jsonc`, after saving a backup
-next to it. It only adds or replaces lines that start with its own
-`"trigger.cast…"` keys. Leave out `--menu` to keep your menu untouched.
+next to it. It records the exact lines it adds and later replaces or removes only
+those. If you already have your own `"trigger.cast"` menu it adds nothing, and any
+`"trigger.cast…"` entry of yours is kept instead of tvcast's. Leave out `--menu`
+to keep your menu untouched.
 
 If the widget isn't on the bar yet: `omarchy bar put megascan.tvcast --section right`.
 
