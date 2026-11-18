@@ -174,3 +174,6 @@
   device cache, menu options), not after parsing it back: a tab or newline in a device name
   can forge extra fields or rows. When parsing such a list, re-check every security-relevant
   field against the trusted source (DLNA URLs must be in the vetted SSDP `locations` set).
+- **The real TV is someone's living room.** Never start, resume or seek the user's own media
+  on it for a test without asking first. Test on the item the user names, put the queue back
+  to how it was, and leave the TV paused or stopped as you found it, never playing.
