@@ -405,9 +405,61 @@ dev_control() {
     pause) soap Pause >/dev/null ;;
     play) soap Play '<Speed>1</Speed>' >/dev/null ;;
     stop) soap Stop >/dev/null ;;
-    seek) soap Seek "<Unit>REL_TIME</Unit><Target>$(s_to_hms "$(uint "$2")")</Target>" >/dev/null ;;
+    seek) dlna_seek "$2" ;;
     *) return 2 ;;
   esac
+}
+
+# dlna_wait_state <regex> <tries>: poll the transport state until it matches,
+# up to <tries> more times, 0.5 s apart. Prints the last state; fails on timeout.
+dlna_wait_state() {
+  local want=$1 n=$2 st=""
+  while :; do
+    st=$(transport_state 2>/dev/null)
+    [[ $st =~ $want ]] && { printf '%s\n' "$st"; return 0; }
+    ((n-- > 0)) || break
+    sleep 0.5
+  done
+  printf '%s\n' "${st:-UNKNOWN}"
+  return 1
+}
+
+# dlna_seek <secs>: LG webOS hangs for good (LG_TRANSITIONING, only Stop
+# allowed, later seeks fail with 710) when it gets a Seek while paused, and
+# refuses one while it is still loading. So: seek only from PLAYING, wait out
+# a short TRANSITIONING, and seek a paused TV by playing, seeking, pausing.
+# Seeks are serialised so scroll bursts don't interleave that dance.
+# On failure SEEK_ERR holds a message for the user.
+SEEK_ERR=""
+dlna_seek() {
+  local target st repause=""
+  target=$(s_to_hms "$(uint "$1")")
+  exec 8>"$CACHE_DIR/seek.lock"
+  flock -w 20 8 || { SEEK_ERR="Another seek is still running."; return 1; }
+  st=$(dlna_wait_state '^(PLAYING|PAUSED_PLAYBACK|STOPPED|NO_MEDIA_PRESENT)$' 20) || true
+  case $st in
+    PLAYING) ;;
+    PAUSED_PLAYBACK)
+      soap Play '<Speed>1</Speed>' >/dev/null || { SEEK_ERR="The TV didn't resume, so it can't seek."; return 1; }
+      repause=1
+      dlna_wait_state '^PLAYING$' 20 >/dev/null || { SEEK_ERR="The TV is still loading this file. Try again in a moment."; return 1; }
+      ;;
+    LG_TRANSITIONING) SEEK_ERR="The TV is stuck loading this file. Press Stop, then Play."; return 1 ;;
+    *TRANSITIONING) SEEK_ERR="The TV is still loading this file. Try again in a moment."; return 1 ;;
+    *) SEEK_ERR="The TV isn't playing anything it can seek."; return 1 ;;
+  esac
+  if ! soap Seek "<Unit>REL_TIME</Unit><Target>$target</Target>" >/dev/null; then
+    if [[ $(transport_state 2>/dev/null) == *TRANSITIONING ]]; then
+      SEEK_ERR="The TV is stuck loading this file. Press Stop, then Play."
+    else
+      SEEK_ERR="This TV can't seek in this file."
+    fi
+    return 1
+  fi
+  if [[ -n $repause ]]; then
+    sleep 1
+    soap Pause >/dev/null || true
+  fi
 }
 
 # ---------- discovery ----------
@@ -982,7 +1034,7 @@ cmd_seek() {
     echo "usage: tvcast seek <+N|-N|secs|hh:mm:ss>" >&2
     return 2
   fi
-  dev_control seek "$(hms_to_s "$arg")"
+  dev_control seek "$(hms_to_s "$arg")" || { [[ -n $SEEK_ERR ]] && die "$SEEK_ERR"; return 1; }
 }
 
 # seek-to: absolute seek in seconds, clamped to the track (the panel's slider).
@@ -993,7 +1045,7 @@ cmd_seek_to() {
   read -r pos dur < <(position_info) || die "The TV did not report a position."
   ((dur > 0)) || die "The TV reports no duration for this item, so it can't seek."
   ((target > dur - 1)) && target=$((dur - 1))
-  dev_control seek "$target" || die "The TV refused the seek."
+  dev_control seek "$target" || die "${SEEK_ERR:-The TV refused the seek.}"
 }
 
 # list: queue plus now-playing, no network calls. status --json adds the TV's

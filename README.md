@@ -14,7 +14,7 @@ Cast protocol for a Chromecast.
   - Idle, it shows a cast icon. Click it for "Cast files…" and "Add to queue…", plus
     the TV to cast to, with a button to search again.
   - While casting, it shows `▶ Title (2/5)`. Click opens the queue panel: progress
-    (click or drag the bar to seek; greyed out when the TV reports no duration), previous, −30 s, play/pause, +30 s, next and stop, the queue (hover
+    (click or drag the bar to seek; greyed out when the TV reports no duration or is still loading the file), previous, −30 s, play/pause, +30 s, next and stop, the queue (hover
     an item to move or remove it, click to play it), and the file actions.
   - Middle-click pauses or resumes, right-click stops, and scrolling seeks 30 s.
 - **Queue:** moves to the next file when the TV reports the current one finished.

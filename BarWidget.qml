@@ -41,6 +41,8 @@ BarWidget {
   readonly property bool hasQueue: count > 0
   readonly property bool engaged: casting || hasQueue
   readonly property bool paused: transport === "PAUSED_PLAYBACK"
+  // The TV takes seeks only once a file has loaded (LG webOS hangs otherwise).
+  readonly property bool canSeek: casting && duration > 0 && !/TRANSITIONING|STOPPED|NO_MEDIA/.test(transport)
   readonly property bool playing: casting && !paused
   readonly property string stateGlyph: !casting ? "󰓛" : (paused ? "󰏤" : "󰐊")
   readonly property int maxTitleChars: 26
@@ -157,7 +159,7 @@ BarWidget {
       else if (mouseButton === Qt.MiddleButton) { if (root.engaged) root.run(["toggle"]) }
       else { root.popupOpen = !root.popupOpen; if (root.popupOpen) root.refresh() }
     }
-    onWheelMoved: function(delta) { if (root.casting) root.run(["seek", delta > 0 ? "+30" : "-30"]) }
+    onWheelMoved: function(delta) { if (root.canSeek) root.run(["seek", delta > 0 ? "+30" : "-30"]) }
   }
 
   // Panel text follows the popup palette, as Omarchy's own popups do.
@@ -274,15 +276,15 @@ BarWidget {
 
       // Progress: click or drag to seek. The slider spans the full row height
       // for a bigger hit area. Greyed out when the TV reports no duration
-      // (images, some streams).
+      // (images, some streams) or is still loading.
       Item {
         id: progressRow
         readonly property bool seekable: root.duration > 0
         width: parent.width
         height: Math.max(posLabel.implicitHeight, seekSlider.implicitHeight, Style.space(30))
         visible: root.casting
-        enabled: seekable
-        opacity: seekable ? 1 : 0.4
+        enabled: root.canSeek
+        opacity: root.canSeek ? 1 : 0.4
 
         PlainLabel {
           id: posLabel
@@ -329,7 +331,7 @@ BarWidget {
         LayoutMirroring.childrenInherit: true
 
         IconButton { iconText: "󰒮"; tooltipText: strings.t("button.previous"); enabled: root.currentIndex > 0; onClicked: root.run(["prev"]) }
-        IconButton { iconText: "󰶖"; tooltipText: strings.t("button.back30"); enabled: root.casting && root.duration > 0; onClicked: root.run(["seek", "-30"]) }
+        IconButton { iconText: "󰶖"; tooltipText: strings.t("button.back30"); enabled: root.canSeek; onClicked: root.run(["seek", "-30"]) }
         IconButton {
           iconText: root.playing ? "󰏤" : "󰐊"
           tooltipText: root.playing ? strings.t("button.pause") : strings.t("button.play")
@@ -337,7 +339,7 @@ BarWidget {
           horizontalPadding: Style.spacing.panelGap
           onClicked: root.run(["toggle"])
         }
-        IconButton { iconText: "󰴆"; tooltipText: strings.t("button.forward30"); enabled: root.casting && root.duration > 0; onClicked: root.run(["seek", "+30"]) }
+        IconButton { iconText: "󰴆"; tooltipText: strings.t("button.forward30"); enabled: root.canSeek; onClicked: root.run(["seek", "+30"]) }
         IconButton { iconText: "󰒭"; tooltipText: strings.t("button.next"); enabled: root.currentIndex + 1 < root.count; onClicked: root.run(["next"]) }
         IconButton { iconText: "󰓛"; tooltipText: strings.t("button.stop"); enabled: root.casting; onClicked: root.run(["stop"]) }
       }

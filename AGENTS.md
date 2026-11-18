@@ -71,6 +71,13 @@
   directly from commands. DLNA behaviour must stay byte-for-byte the same: compare the
   SOAP log of `pause, resume, seek-to, seek ±N, seek h:mm:ss, toggle, stop` against the
   previous release with a fake TV.
+- **DLNA seeks go through `dlna_seek` and only ever reach the TV from PLAYING.** LG webOS
+  hangs for good on a Seek sent while PAUSED_PLAYBACK (LG_TRANSITIONING, actions = Stop
+  only, every later Seek fails with 710, Play with 701; only Stop + Play recovers), and
+  refuses seeks while TRANSITIONING (loading). A paused TV is sought with Play, wait for
+  PLAYING, Seek, Pause. Seeks are serialised by `seek.lock`. The bar's `canSeek` greys the
+  slider, ±30 s and scroll out while the TV is loading or stopped. Fake TVs used for seek
+  tests must hang on a paused Seek like the LG does.
 - **Chromecast control is `bin/tvcast-chromecast` (python-pychromecast, optional).** Call it
   only through `cast_helper`, which enforces a LAN IP, `timeout`, `ulimit -v` (Cast frames
   declare their own length) and a 4 KiB output cap. The helper must never launch an app on
