@@ -27,6 +27,10 @@ BarWidget {
   property bool transcoding: false
   property int position: 0
   property int duration: 0
+  // Seek in flight: the knob holds this position (seconds) until the TV
+  // reports it, or seekHold times out, so it doesn't snap back meanwhile.
+  property int seekTarget: -1
+  readonly property int shownPosition: seekTarget >= 0 ? seekTarget : position
   property int currentIndex: 0
   property var items: []
   property bool popupOpen: false
@@ -76,6 +80,13 @@ BarWidget {
     root.transport = root.casting ? String(d.transport || "").slice(0, 32) : ""
     root.position = root.casting ? (Number(d.position) || 0) : 0
     root.duration = root.casting ? (Number(d.duration) || 0) : 0
+    if (root.seekTarget >= 0 && (!root.casting || Math.abs(root.position - root.seekTarget) <= 3)) root.seekTarget = -1
+  }
+
+  function seekTo(sec) {
+    root.seekTarget = Math.max(0, Math.round(sec))
+    seekHold.restart()
+    root.run(["seek-to", root.seekTarget])
   }
 
   // Fill only the placeholders a string has, so translations may drop some.
@@ -122,9 +133,13 @@ BarWidget {
   Timer {
     interval: 2000
     repeat: true
-    running: root.casting
+    // Paused while the seek knob is held, so a poll can't move it.
+    running: root.casting && !root.scrubbing
     onTriggered: root.refresh()
   }
+
+  property bool scrubbing: false
+  Timer { id: seekHold; interval: 6000; onTriggered: root.seekTarget = -1 }
 
   Timer { id: refreshSoon; interval: 700; onTriggered: root.refresh() }
 
@@ -257,18 +272,24 @@ BarWidget {
         }
       }
 
-      // Progress (drag to seek)
+      // Progress: click or drag to seek. The slider spans the full row height
+      // for a bigger hit area. Greyed out when the TV reports no duration
+      // (images, some streams).
       Item {
+        id: progressRow
+        readonly property bool seekable: root.duration > 0
         width: parent.width
-        height: Math.max(posLabel.implicitHeight, seekSlider.implicitHeight)
-        visible: root.casting && root.duration > 0
+        height: Math.max(posLabel.implicitHeight, seekSlider.implicitHeight, Style.space(30))
+        visible: root.casting
+        enabled: seekable
+        opacity: seekable ? 1 : 0.4
 
         PlainLabel {
           id: posLabel
           anchors.left: parent.left
           anchors.verticalCenter: parent.verticalCenter
           font.pixelSize: Style.font.caption
-          text: root.clock(seekSlider.dragging ? seekSlider.value : root.position)
+          text: progressRow.seekable ? root.clock(seekSlider.dragging ? seekSlider.liveValue : root.shownPosition) : "–:––"
         }
         PanelSlider {
           id: seekSlider
@@ -277,23 +298,25 @@ BarWidget {
           anchors.right: durLabel.left
           anchors.leftMargin: Style.space(8)
           anchors.rightMargin: Style.space(8)
-          anchors.verticalCenter: parent.verticalCenter
+          anchors.top: parent.top
+          anchors.bottom: parent.bottom
           minimum: 0
           maximum: Math.max(1, root.duration)
-          step: 1
+          step: 30
           integer: true
-          value: root.position
+          value: progressRow.seekable ? root.shownPosition : 0
+          onDraggingChanged: root.scrubbing = dragging
           trackColor: Style.selectedFillFor(root.pfg, Commons.Color.accent)
           fillColor: root.pfg
           knobColor: root.pfg
-          onReleased: function(v) { root.run(["seek", String(Math.round(v))]) }
+          onReleased: function(v) { root.seekTo(v) }
         }
         PlainLabel {
           id: durLabel
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
           font.pixelSize: Style.font.caption
-          text: root.clock(root.duration)
+          text: progressRow.seekable ? root.clock(root.duration) : "–:––"
         }
       }
 
@@ -306,7 +329,7 @@ BarWidget {
         LayoutMirroring.childrenInherit: true
 
         IconButton { iconText: "󰒮"; tooltipText: strings.t("button.previous"); enabled: root.currentIndex > 0; onClicked: root.run(["prev"]) }
-        IconButton { iconText: "󰶖"; tooltipText: strings.t("button.back30"); enabled: root.casting; onClicked: root.run(["seek", "-30"]) }
+        IconButton { iconText: "󰶖"; tooltipText: strings.t("button.back30"); enabled: root.casting && root.duration > 0; onClicked: root.run(["seek", "-30"]) }
         IconButton {
           iconText: root.playing ? "󰏤" : "󰐊"
           tooltipText: root.playing ? strings.t("button.pause") : strings.t("button.play")
@@ -314,7 +337,7 @@ BarWidget {
           horizontalPadding: Style.spacing.panelGap
           onClicked: root.run(["toggle"])
         }
-        IconButton { iconText: "󰴆"; tooltipText: strings.t("button.forward30"); enabled: root.casting; onClicked: root.run(["seek", "+30"]) }
+        IconButton { iconText: "󰴆"; tooltipText: strings.t("button.forward30"); enabled: root.casting && root.duration > 0; onClicked: root.run(["seek", "+30"]) }
         IconButton { iconText: "󰒭"; tooltipText: strings.t("button.next"); enabled: root.currentIndex + 1 < root.count; onClicked: root.run(["next"]) }
         IconButton { iconText: "󰓛"; tooltipText: strings.t("button.stop"); enabled: root.casting; onClicked: root.run(["stop"]) }
       }

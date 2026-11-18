@@ -13,6 +13,7 @@
 #   tvcast list                      queue as JSON (no network)
 #   tvcast play | toggle | pause | resume
 #   tvcast seek <+N|-N|secs|hh:mm:ss>
+#   tvcast seek-to <secs>            jump to an absolute position (clamped)
 #   tvcast stop                      stop playback, keep the queue
 #   tvcast status [--json]           now playing (+ TV state and position)
 #   tvcast devices [--json]          discover TVs (takes a few seconds)
@@ -596,6 +597,17 @@ cmd_seek() {
   soap Seek "<Unit>REL_TIME</Unit><Target>$arg</Target>" >/dev/null
 }
 
+# seek-to: absolute seek in seconds, clamped to the track (the panel's slider).
+cmd_seek_to() {
+  local target=${1:-} pos dur
+  [[ $target =~ ^[0-9]+$ ]] || die "usage: tvcast seek-to <seconds>"
+  is_active || die "Nothing is casting."
+  read -r pos dur < <(position_info) || die "The TV did not report a position."
+  ((dur > 0)) || die "The TV reports no duration for this item, so it can't seek."
+  ((target > dur - 1)) && target=$((dur - 1))
+  soap Seek "<Unit>REL_TIME</Unit><Target>$(s_to_hms "$target")</Target>" >/dev/null || die "The TV refused the seek."
+}
+
 # list: queue plus now-playing, no network calls. status --json adds the TV's
 # transport state and position while casting.
 cmd_list() {
@@ -655,6 +667,7 @@ case ${1:-cast} in
   play) cmd_play ;;
   resume) cmd_resume ;;
   seek) shift; cmd_seek "$@" ;;
+  seek-to) shift; cmd_seek_to "$@" ;;
   stop) cmd_stop ;;
   status) shift; cmd_status "$@" ;;
   notify-status) cmd_notify_status ;;
