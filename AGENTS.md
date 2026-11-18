@@ -94,3 +94,40 @@
   description itself, so our origin checks only hold if go2tv pins endpoints too
   (`validateServiceEndpoints`, added in 2.5.0). Raise `GO2TV_MIN` if a later go2tv fixes
   another device-trust bug. Test stubs for go2tv must answer `-version`.
+
+## Review round 0.3.3 (proactive audit against the marketplace's review patterns)
+
+- **IP literals must be canonical before any check.** curl (and WHATWG parsers) read
+  `010.0.0.1` as octal 8.0.0.1, so a check that reads decimal and a client that reads octal
+  disagree. `url_origin` accepts only dotted decimal without leading zeros, and ports
+  1-65535 without leading zeros (`:08009` would split `url_type` from go2tv's routing).
+  Test: `010.0.0.1`, `0172.020.1.1`, `10.0.0.01`, `:08009`, `:70000` must all be refused.
+- **"LAN" excludes this machine.** `lan_url` refuses every address on `ip -o addr`
+  (including docker/libvirt bridges). A device advertising our own LAN IP would reach
+  local services bound to 0.0.0.0. IPv6 is compared after `ipv6_full` expansion.
+- **Private data on disk is owner-only.** `bin/tvcast` runs with `umask 077` and
+  `chmod 700`s its cache and state dirs on every start (older installs made them 755).
+  The queue, state and `session.log` name what the user watches. `install.sh` makes
+  `plugin-backups/` 0700 too. Check with `stat` after a run under `umask 022`.
+- **Untrusted text must never look like an option.** `omarchy-notification-send` parses a
+  headline or body such as `--image=URL` as an option. `notify` puts U+2060 before
+  any value starting with `-`. Test with a file named `--image=http:x.mp4` and
+  `tvcast notify-status`.
+- **Device names are cleaned at discovery** (`clean_text`: C0/DEL/C1 control characters
+  removed, 120 chars), and tabs become spaces before splitting go2tv's output. That
+  keeps terminal escape sequences (OSC 52 and the like) out of `tvcast devices`.
+- **The runner re-validates the queue's device URL** with `lan_url` before every go2tv
+  call. The queue file is re-read per item.
+- **Installers never take over a name they don't own.** `install.sh` links
+  `~/.local/bin/tvcast` only if it is free or already resolves into this plugin.
+  Menu edits (install and uninstall) touch only lines that *start* with one of the
+  snippet's exact keys, or the `// tvcast: ` comment. A user's `"trigger.castle"`, a
+  mention inside a string, or a one-line file are left alone. The menu is rewritten
+  atomically (temp file + rename, following a dotfiles symlink), and the install
+  aborts without a closing brace. Keep the key list in `install.sh`/`uninstall.sh` in step
+  with `menu/omarchy-menu.snippet.jsonc`.
+- **By design, documented in the README:** go2tv's media server is unauthenticated
+  HTTP on the TV-facing address while a file plays. The README's first firewall rule
+  is scoped to the TV's IP. File paths appear in go2tv's argv (a same-basename symlink
+  was rejected: go2tv's artwork lookup reads the file's real directory). go2tv pins
+  the renderer IP but not the port, so it may use another port on the same device.

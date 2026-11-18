@@ -58,7 +58,11 @@ OK_CONTAINERS=" mp4 m4v mkv mov ts m2ts mpg mpeg avi "
 OK_VCODECS=" h264 hevc mpeg2video mpeg4 "
 OK_ACODECS=" aac ac3 eac3 mp3 mp2 pcm_s16le pcm_s24le "
 
+# Queue, state and go2tv's log name the files being watched: owner-only.
+# chmod also tightens dirs created by older versions with the default umask.
+umask 077
 mkdir -p "$CACHE_DIR" "$STATE_DIR"
+chmod 700 "$CACHE_DIR" "$STATE_DIR" 2>/dev/null
 
 # markup_escape <text>: the notification daemon renders markup (links, bold), and
 # titles and TV names are untrusted, so &, < and > are always escaped.
@@ -70,10 +74,24 @@ markup_escape() {
   printf '%s' "$s"
 }
 
+# no_option <text>: omarchy-notification-send reads a headline or body that
+# looks like an option ("--image=URL", "-r 5") as one, and titles and TV names
+# are untrusted, so a leading dash gets a word joiner (U+2060) in front.
+no_option() { if [[ ${1:-} == -* ]]; then printf '\u2060%s' "$1"; else printf '%s' "${1:-}"; fi; }
+
 notify() { # notify <urgency> <headline> [body]; TVCAST_QUIET=1 prints instead
-  [[ -n ${TVCAST_QUIET:-} ]] && { printf 'notify: %s: %s\n' "$2" "${3:-}" >&2; return; }
-  omarchy-notification-send -g "󰄘" -u "$1" "$(markup_escape "$2")" "$(markup_escape "${3:-}")" >/dev/null 2>&1 ||
+  [[ -n ${TVCAST_QUIET:-} ]] && { printf 'notify: %s: %s\n' "$(no_option "$2")" "$(no_option "${3:-}")" >&2; return; }
+  omarchy-notification-send -g "󰄘" -u "$1" "$(no_option "$(markup_escape "$2")")" "$(no_option "$(markup_escape "${3:-}")")" >/dev/null 2>&1 ||
     printf '%s: %s\n' "$2" "${3:-}" >&2
+}
+
+# clean_text <max>: drop control characters (escape sequences, tabs, newlines)
+# from untrusted text on stdin and cap its length.
+# C0 and DEL go byte-wise; C1 controls (U+0080-U+009F, e.g. the 8-bit CSI) too.
+clean_text() {
+  local s
+  s=$(LC_ALL=C tr -d '\000-\037\177' | LC_ALL=C sed 's/\xc2[\x80-\x9f]//g')
+  printf '%s\n' "${s:0:$1}"
 }
 
 die() {
@@ -131,15 +149,66 @@ fetch() { "${CURL[@]}" "$@" | head -c "$MAX_BODY"; } # fetch <curl args...>
 
 # url_origin <url>: prints scheme://host:port (lowercase), fails if malformed.
 # Hostnames are rejected on purpose (DNS rebinding); TVs announce IP addresses.
+# Only canonical dotted decimal is accepted: curl reads "010.0.0.1" as octal
+# (8.0.0.1), so a leading zero would make our check and curl's target differ.
+# Ports must be canonical too, or ":08009" would split url_type and go2tv.
+OCTET='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
 url_origin() {
   local u=${1,,} scheme host port
-  [[ $u =~ ^(https?)://([0-9.]+|\[[0-9a-f:]+\])(:([0-9]{1,5}))?(/|$) ]] || return 1
-  scheme=${BASH_REMATCH[1]} host=${BASH_REMATCH[2]} port=${BASH_REMATCH[4]}
+  [[ $u =~ ^(https?)://($OCTET\.$OCTET\.$OCTET\.$OCTET|\[[0-9a-f:]+\])(:([1-9][0-9]{0,4}))?(/|$) ]] || return 1
+  scheme=${BASH_REMATCH[1]} host=${BASH_REMATCH[2]} port=${BASH_REMATCH[8]}
   [[ -n $port ]] || { [[ $scheme == https ]] && port=443 || port=80; }
+  ((port <= 65535)) || return 1
   printf '%s://%s:%s\n' "$scheme" "$host" "$port"
 }
 
-# lan_url <url>: succeeds only for a private/link-local LAN address.
+# ipv6_full <addr>: the address as 8 four-digit hex groups, so differently
+# compressed spellings compare equal. Fails on anything malformed.
+ipv6_full() {
+  local a=${1,,} head tail out="" g n i
+  local -a hg=() tg=()
+  [[ $a =~ ^[0-9a-f:]+$ && $a != *:::* ]] || return 1
+  if [[ $a == *::* ]]; then
+    head=${a%%::*} tail=${a#*::}
+    [[ $tail != *::* ]] || return 1
+    [[ -n $head ]] && IFS=: read -ra hg <<<"$head"
+    [[ -n $tail ]] && IFS=: read -ra tg <<<"$tail"
+    n=$((8 - ${#hg[@]} - ${#tg[@]}))
+    ((n >= 1)) || return 1
+    for ((i = 0; i < n; i++)); do hg+=(0); done
+    hg+=("${tg[@]}")
+  else
+    IFS=: read -ra hg <<<"$a"
+  fi
+  ((${#hg[@]} == 8)) || return 1
+  for g in "${hg[@]}"; do
+    [[ $g =~ ^[0-9a-f]{1,4}$ ]] || return 1
+    out+=$(printf '%04x' "$((16#$g))"):
+  done
+  printf '%s\n' "${out%:}"
+}
+
+# own_address <ip>: true if the IP belongs to this machine (any interface,
+# docker/libvirt bridges included). A device that announces our own LAN IP
+# would otherwise aim our requests at local services listening on 0.0.0.0.
+LOCAL_ADDRS=""
+own_address() {
+  local ip=$1 a
+  [[ -n $LOCAL_ADDRS ]] || LOCAL_ADDRS=$(ip -o addr show 2>/dev/null | awk '{print $4}' | sed 's#/.*##')
+  [[ -n $LOCAL_ADDRS ]] || return 1
+  if [[ $ip == *:* ]]; then
+    ip=$(ipv6_full "$ip") || return 0
+    while read -r a; do
+      [[ $a == *:* ]] || continue
+      [[ $(ipv6_full "${a%%%*}") == "$ip" ]] && return 0
+    done <<<"$LOCAL_ADDRS"
+    return 1
+  fi
+  grep -qxF -- "$ip" <<<"$LOCAL_ADDRS"
+}
+
+# lan_url <url>: succeeds only for a private/link-local LAN address that is
+# not one of this machine's own addresses.
 # TVCAST_ALLOW_LOOPBACK=1 also allows 127.0.0.0/8 (for testing with a fake TV).
 lan_url() {
   local origin host a b c d
@@ -149,14 +218,15 @@ lan_url() {
   if [[ $host =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
     a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]})) c=$((10#${BASH_REMATCH[3]})) d=$((10#${BASH_REMATCH[4]}))
     ((a <= 255 && b <= 255 && c <= 255 && d <= 255)) || return 1
-    ((a == 10)) && return 0
-    ((a == 172 && b >= 16 && b <= 31)) && return 0
-    ((a == 192 && b == 168)) && return 0
-    ((a == 169 && b == 254 && !(c == 169 && d == 254))) && return 0 # not cloud metadata
-    ((a == 127)) && [[ ${TVCAST_ALLOW_LOOPBACK:-} == 1 ]] && return 0
-    return 1
+    ((a == 127)) && { [[ ${TVCAST_ALLOW_LOOPBACK:-} == 1 ]]; return; }
+    ((a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) ||
+      (a == 169 && b == 254 && !(c == 169 && d == 254)))) || return 1 # not cloud metadata
+    ! own_address "$host"
+    return
   fi
-  [[ $host =~ ^\[(fe[89ab][0-9a-f]|f[cd][0-9a-f]{2}): ]] # IPv6 link-local / ULA
+  [[ $host =~ ^\[(fe[89ab][0-9a-f]|f[cd][0-9a-f]{2}): ]] || return 1 # IPv6 link-local / ULA
+  host=${host#\[}
+  ! own_address "${host%\]}"
 }
 
 # control_url <device-description-url>: absolute AVTransport controlURL,
@@ -361,10 +431,12 @@ discover() {
   done
   kill -TERM -- "-$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
-  sed -E 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/\x1b\][^\x1b]*\x1b\\//g; s/\x1b[=>]//g' "$out" | tr '\r' '\n' |
+  sed -E 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/\x1b\][^\x1b]*\x1b\\//g; s/\x1b[=>]//g' "$out" | tr '\r\t' '\n ' |
     sed -nE 's/^[^[:alnum:]]*(.*[^ ]) +(DLNA|Chromecast) +\[(http[^]]+)\].*$/\1\t\3\t\2/p' | sort -u |
     while IFS=$'\t' read -r name url tag; do
       lan_url "$url" || continue
+      name=$(clean_text 120 <<<"$name")
+      [[ -n $name ]] || name=TV
       # go2tv routes -t by port alone, so skip anything it would misroute
       # (Chromecast groups on other ports, a DLNA device on 8009).
       [[ ${tag,,} == "$(url_type "$url")" ]] || continue
@@ -529,7 +601,7 @@ items_json() { # items_json <file...>: JSON array of queue items, skipping non-f
   for f in "$@"; do
     f=$(readlink -f -- "$f") || continue
     [[ -f $f ]] || { echo "tvcast: skipping $f (not a file)" >&2; continue; }
-    jq -cn --arg file "$f" --arg title "$(basename -- "${f%.*}")" --arg kind "$(media_kind "$f")" \
+    jq -cn --arg file "$f" --arg title "$(basename -- "${f%.*}" | clean_text 200)" --arg kind "$(media_kind "$f")" \
       '{file: $file, title: $title, kind: $kind}'
   done | jq -cs .
 }
@@ -667,6 +739,9 @@ cmd_run() {
     url=$(jq -r '.device.url // empty' <<<"$q")
     ctl=$(jq -r '.device.control // empty' <<<"$q")
     [[ -n $url && -n $ctl ]] || die "No TV selected."
+    # The queue file is re-read on every item; never hand go2tv a URL that
+    # wouldn't pass discovery.
+    lan_url "$url" || die "Refusing a TV address that is not on the local network: $url"
     type=$(url_type "$url")
     if [[ $type == chromecast && -z $blind ]] && ! cast_ready; then
       blind=1

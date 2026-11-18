@@ -40,7 +40,8 @@ Cast protocol for a Chromecast.
 - [go2tv](https://github.com/alexballas/go2tv/releases) **2.5.0 or newer** (older versions follow
   whatever control URL a device advertises; tvcast refuses them): put the `go2tv` binary on
   your `PATH` or in `~/.local/bin`, or install the AUR package `go2tv`.
-- `ffmpeg`/`ffprobe`, `jq`, `curl`, `libxml2` (`xmllint`) and `util-linux` (`script`).
+- `ffmpeg`/`ffprobe`, `jq`, `curl`, `libxml2` (`xmllint`), `file`, `iproute2` (`ip`),
+  `python` (menu edits) and `util-linux` (`script`, `setsid`, `flock`).
   Omarchy ships all of these.
 - A **DLNA/UPnP media renderer**, which most smart TVs are (LG webOS, Samsung,
   Sony, Philips and so on), or a **Chromecast** / Google TV (see below).
@@ -65,35 +66,30 @@ Chromecast may not work, and Chromecast groups (speaker groups) aren't listed.
 
 Omarchy enables ufw with incoming connections denied. The TV has to reach the
 media server go2tv runs on your machine, and discovery needs replies to get
-back. Allow them from your LAN only:
+back. tvcast never changes the firewall; you run these rules yourself.
+
+Open the media server to the TV (or Chromecast) alone. Give it a fixed address
+first (a DHCP reservation in your router):
 
 ```sh
-sudo ufw allow from <your-LAN>/24 to any port 3500:4499 proto tcp   # go2tv media server
+sudo ufw allow from <TV-IP> to any port 3500:4499 proto tcp         # go2tv media server, TV only
+```
+
+Discovery replies can come from any device, so these stay LAN-wide. They carry
+no file contents:
+
+```sh
 sudo ufw allow from <your-LAN>/24 to any port 3339:3438 proto udp   # go2tv discovery replies
 sudo ufw allow from <your-LAN>/24 to any port 1900 proto udp        # SSDP
-sudo ufw allow from <your-LAN>/24 to any port 5353 proto udp        # mDNS
+sudo ufw allow from <your-LAN>/24 to any port 5353 proto udp        # mDNS (Chromecast)
 ```
 
-A Chromecast needs the same media server ports and mDNS (5353/udp) to be
-found. Scoped to the device:
-
-```sh
-sudo ufw allow from <Chromecast-IP> to any port 3500:4499 proto tcp  # go2tv media server
-sudo ufw allow from <your-LAN>/24 to any port 5353 proto udp         # mDNS discovery
-```
-
-Tighter, if your TV has a fixed address (a DHCP reservation in your router):
-open the media server port to the TV alone.
-
-```sh
-sudo ufw allow from <TV-IP> to any port 3500:4499 proto tcp        # go2tv media server, TV only
-```
-
-Why: while a file is casting, go2tv serves it over plain HTTP with no password
-or token, so any device that can reach that port can fetch the file. Scoping
-the rule to the TV's IP keeps other machines on the network (guests, phones,
-smart plugs) from reading what you cast. The discovery rules can stay
-LAN-wide, since they carry no file contents.
+Why the media rule is per device: while a file is casting, go2tv serves it,
+and its sidecar subtitles, over plain HTTP with no password or token, on the
+address that faces the TV. Any machine that can reach that port can fetch the
+file during playback; the URL contains the file's name. That is how DLNA and
+Cast receivers fetch media, so it can't be avoided, only fenced in. Without a
+fixed TV address you can open `from <your-LAN>/24` instead, at that cost.
 
 ## Install
 
@@ -103,9 +99,11 @@ omarchy plugin add https://github.com/megascan/omarchy-tvcast --enable
 ```
 
 `omarchy plugin add` installs the bar widget, and the widget works on its own.
-`install.sh` links the `tvcast` CLI into `~/.local/bin`. `--menu` also adds the menu
+`install.sh` links the `tvcast` CLI into `~/.local/bin`. If something else already
+uses that name, it leaves it alone and says so. `--menu` also adds the menu
 entries to `~/.config/omarchy/extensions/omarchy-menu.jsonc`, after saving a backup
-next to it. Leave out `--menu` to keep your menu untouched.
+next to it. It only adds or replaces lines that start with its own
+`"trigger.cast…"` keys. Leave out `--menu` to keep your menu untouched.
 
 If the widget isn't on the bar yet: `omarchy bar put megascan.tvcast --section right`.
 
@@ -123,30 +121,45 @@ tvcast seek +30 | seek -30 | seek 1:02:03 | seek-to <seconds>
 tvcast status [--json] | devices [--json] | pick-device
 ```
 
-Playback runs as the transient user service `tvcast.service`, so you can also stop
-it with `systemctl --user stop tvcast`. State lives in `~/.local/state/tvcast/`
-(queue) and `~/.cache/tvcast/` (now playing, last TV, go2tv's `session.log`).
+Playback runs as the transient user service `tvcast.service` (created with
+`systemd-run --user`, removed when it stops), so you can also stop it with
+`systemctl --user stop tvcast`. tvcast touches no other service and never uses sudo.
+Playback runs go2tv under `script(1)`, because go2tv's CLI needs a terminal.
+State lives in `~/.local/state/tvcast/` (queue) and `~/.cache/tvcast/` (now
+playing, last TV, go2tv's `session.log`). Both directories and their files are
+owner-only (0700/0600). Nothing in them is ever executed.
 `TVCAST_TRANSCODE=always|never` overrides the transcode check.
 
 Network safety: tvcast only talks to TVs on private LAN IP addresses (10/8, 172.16/12,
-192.168/16, link-local, IPv6 ULA), never follows redirects, and only sends playback
-commands to the same address and port that served the TV's device description.
+192.168/16, link-local, IPv6 ULA), written in plain dotted decimal (no hostnames,
+no octal or zero-padded forms). It refuses this machine's own addresses, never
+follows redirects, caps every reply at 1 MiB, and only sends playback commands to
+the same address and port that served the TV's device description. go2tv
+(2.5.0+) fetches the description again itself. It pins every request to the IP
+address it first resolved, and follows a redirect only to that same host.
 Chromecast commands go only to the cast port of the address you picked, and the
-helper runs under a timeout and a memory limit.
+helper runs under a timeout and a memory limit. Device names are stripped of
+control characters and shortened.
 `TVCAST_ALLOW_LOOPBACK=1` also allows 127.0.0.1, for testing against a fake TV.
+
+Privacy: the file's path is on go2tv's command line while it plays, like any
+media player, so other local accounts can see it in `ps`. The TV, and anything
+that can reach the media port, sees its name.
 
 ## Uninstall
 
 ```sh
-~/.config/omarchy/plugins/megascan.tvcast/uninstall.sh   # stops casting; removes the CLI link, menu entries and state
+~/.config/omarchy/plugins/megascan.tvcast/uninstall.sh   # stops casting; removes the CLI link (if it is ours), menu entries and state; keeps plugin-backups/
 omarchy plugin remove megascan.tvcast
 ```
 
 ## Development
 
 From a clone, `./install.sh` copies the working tree into
-`~/.config/omarchy/plugins/megascan.tvcast`, replacing what's there, because the
-plugin validator doesn't allow symlinks. Run it again after each change.
+`~/.config/omarchy/plugins/megascan.tvcast`, because the plugin validator doesn't
+allow symlinks. An existing install is moved to
+`~/.local/state/tvcast/plugin-backups/` first, never deleted. Run it again
+after each change.
 
 ## License
 

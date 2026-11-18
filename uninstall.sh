@@ -8,9 +8,11 @@ menu=$HOME/.config/omarchy/extensions/omarchy-menu.jsonc
 
 systemctl --user stop tvcast.service 2>/dev/null
 [[ $(readlink -f "$HOME/.local/bin/tvcast") == */"$id"/bin/tvcast ]] && rm -f "$HOME/.local/bin/tvcast"
-if [[ -f $menu ]] && grep -q '"trigger.cast' "$menu"; then
+# Only the lines install.sh added: a line starting with one of our keys, or our comment.
+ours='^[[:space:]]*("trigger\.cast(\.(file|add|other|play|toggle|next|prev|back|forward|status|stop|clear))?"[[:space:]]*:|// tvcast: )'
+if [[ -f $menu ]] && grep -qE "$ours" "$menu"; then
   cp "$menu" "$menu.bak.$(date +%s)"
-  sed -i '/"trigger\.cast/d; /^ *\/\/ tvcast/d' "$menu"
+  sed -i --follow-symlinks -E "\\#$ours#d" "$menu"
   echo "removed menu entries (backup saved)"
 fi
 state=${XDG_STATE_HOME:-$HOME/.local/state}/tvcast
