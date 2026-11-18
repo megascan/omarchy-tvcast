@@ -87,6 +87,11 @@ it with `systemctl --user stop tvcast`. State lives in `~/.local/state/tvcast/`
 (queue) and `~/.cache/tvcast/` (now playing, last TV, go2tv's `session.log`).
 `TVCAST_TRANSCODE=always|never` overrides the transcode check.
 
+Network safety: tvcast only talks to TVs on private LAN IP addresses (10/8, 172.16/12,
+192.168/16, link-local, IPv6 ULA), never follows redirects, and only sends playback
+commands to the same address and port that served the TV's device description.
+`TVCAST_ALLOW_LOOPBACK=1` also allows 127.0.0.1, for testing against a fake TV.
+
 ## Uninstall
 
 ```sh

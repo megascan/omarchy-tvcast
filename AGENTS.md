@@ -35,3 +35,9 @@
   That removed the `/` from the CLI's absolute path, so every click silently did nothing.
   To check a change, click each action in the live shell and confirm what it does:
   a picker window opens, a notification appears, or the queue state changes.
+- **Treat everything a device announces as untrusted** (SSDP LOCATION, URLBase, controlURL,
+  friendlyName). Every curl goes through `CURL` (http/https only, no redirects), every URL
+  through `lan_url` (private LAN IPs only), and control requests must keep the description's
+  origin (`url_origin`). Otherwise a rogue LAN device can aim our requests at localhost
+  services or the internet (reported by a marketplace reviewer on 0.2.2).
+  Test with a fake description that points controlURL/URLBase elsewhere: it must be refused.
