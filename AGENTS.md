@@ -131,3 +131,8 @@
   is scoped to the TV's IP. File paths appear in go2tv's argv (a same-basename symlink
   was rejected: go2tv's artwork lookup reads the file's real directory). go2tv pins
   the renderer IP but not the port, so it may use another port on the same device.
+- **Gate at the point of use, not at entry points.** The go2tv version check runs in
+  `start_runner` and right before every go2tv launch in the runner loop, because resume paths
+  (Play on a saved queue) skip the CLI commands that discover devices. When adding any check
+  on an external binary or device, put it where the binary is executed or the request is
+  sent, and test the resume path (saved queue + `tvcast play`) as well as a fresh cast.

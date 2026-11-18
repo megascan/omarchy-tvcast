@@ -634,6 +634,7 @@ ensure_device() {
 }
 
 start_runner() {
+  require_go2tv # every path that plays goes through here or the runner loop
   local env=(--setenv=TERM=xterm-256color --setenv="XDG_CACHE_HOME=${XDG_CACHE_HOME:-$HOME/.cache}"
     --setenv="XDG_STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}" --setenv="TVCAST_GO2TV=$GO2TV")
   local v
@@ -756,6 +757,9 @@ cmd_run() {
       continue
     fi
 
+    # Checked before every launch, not only at the CLI entry points: a resumed
+    # queue goes straight to the runner, and go2tv may be replaced mid-queue.
+    require_go2tv
     args=(-v "$file" -t "$url")
     subs="" tc=0
     if [[ $kind == video ]]; then
