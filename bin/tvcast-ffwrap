@@ -4,7 +4,7 @@
 # only be opened by a real media demuxer: a queued file rewritten into a DASH
 # manifest or an HLS playlist would otherwise make ffmpeg read and serve other
 # local files it names.
-FORMATS=mov,matroska,mpegts,avi,mpeg,asf,flv,ogg,mp3,flac,wav,aac,aiff,w64,caf,ac3,eac3,dts,truehd,mpegvideo,m4v,h264,hevc,jpeg_pipe,png_pipe,gif,webp_pipe,bmp_pipe
+FORMATS=mov,matroska,mpegts,avi,mpeg,asf,flv,ogg,mp3,flac,wav,aac,aiff,w64,caf,ac3,eac3,dts,truehd,mpegvideo,m4v,h264,hevc,dv,ivf,obu,amr,amrnb,amrwb,au,voc,jpeg_pipe,png_pipe,gif,webp_pipe,bmp_pipe
 case ${0##*/} in
   ffmpeg) real=${TVCAST_FFMPEG:-} ;;
   ffprobe) real=${TVCAST_FFPROBE:-} ;;

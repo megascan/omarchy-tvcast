@@ -29,8 +29,9 @@ RenderingControl, or over the Cast protocol for a Chromecast.
   audio plays as-is. Everything else gets go2tv's ffmpeg transcode (`-tc`).
   On a Chromecast, go2tv makes that call itself.
 - **Subtitles:** a sidecar with the same name (`movie.srt`, `movie.en.srt`, `.vtt`,
-  `.ass`, `.ssa`) is sent along automatically. A sidecar that links to a file in
-  another folder is ignored.
+  `.ass`, `.ssa`) is sent along automatically. A sidecar is ignored if it links to
+  a file in another folder, if anyone but you can change it, or if it isn't plain
+  subtitle text.
 - **Files:** only local video, audio and image files are queued, judged by their
   content (`file --mime-type`), not their name. Torrent files, playlists (`.m3u`,
   `.pls`), SVG images, URLs and `-` are refused when you queue them, and checked

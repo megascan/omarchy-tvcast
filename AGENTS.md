@@ -383,18 +383,24 @@
   request into `<kind>.pending` (under `<kind>.pending.lock`) and leave. `abs:N` replaces
   what is pending, `rel:±N` adds to it, and the holder resolves a relative one against the
   target it set last, so +30 sent during a drag to 50:00 lands at 50:30. One
+  `<kind>.holder` holds the holder's pid: a request a dead holder left behind is dropped,
+  not merged (waiters check the pid; a new holder takes only one under 2 s old), and a
+  waiter whose holder died waits for the lock itself. One
   `dlna_seek_once` has 10 s in total (`seek_left` caps each SOAP call's `-m`); the Pause
   that puts a paused TV back is retried once and reported if it fails. `position_info`
   fails on an unreadable RelTime, so a relative seek is refused rather than sent from 0.
 - **Reads that decide a command wait for the ID check.** `toggle`, `seek` (Chromecast),
-  `volume` and `mute` run `control_guard` before their first read. `status` reads
+  `seek-to`, `volume` and `mute` run `control_guard` before their first read (`GUARD_PASSED`
+  skips the second check in the same command). `status` reads
   unchecked (display only) and has one 8 s budget (`DEADLINE`, `budget`): each SOAP call
-  and description fetch gets at most what is left. A `rendering` entry is stored only when
+  description fetch and Chromecast helper call gets at most what is left. A `rendering` entry is stored only when
   the description's UDN is the saved ID, and dropped when a volume call fails.
 - **Every queue item has a key** (`r<hex>` from `items_json`; `p<pos>`/`d<pos>` for items
   of older queues, saved at the runner start). `.playing` is the key of the item on screen;
   `cur($act)` (jq) is the current position: that item while active, else `.index`. Row
-  commands take `[key]` and act on the item with that key (`ROWPOS`).
+  commands take `[key]` and act on the item with that key (`ROWPOS`), or on nothing if it
+  is gone: `play_at` checks the key again under the transition lock, before it stops the
+  cast. A repeated key is renamed to a `d<pos>[-n]` no other item has.
 - **Reads never write.** `list`, `status` and the rest of the read path compute from the
   queue and state as they are; they never normalise or rewrite state.json or queue.json.
 - **A runner that is not ours stops nothing.** `foreign_runner` sees an active transient
@@ -406,3 +412,10 @@
   adds `-format_whitelist` (media demuxers only) to every local input, so a file rewritten
   into a DASH manifest or HLS playlist after the checks can't make ffmpeg serve other files.
   A NAS or synced folder where the mount shows the user as owner is covered only by the wrapper.
+- **Sidecars are subtitle text or nothing.** ffmpeg's `subtitles` filter opens the sidecar
+  with no whitelist, so the sidecar passes `only_mine` and `subs_ok` on the private copy:
+  a subtitle mime, the format's header (`1`, `WEBVTT`, `[Script Info]`) and no manifest or
+  playlist marker (`<MPD`, `<?xml`, `#EXTM3U`, `CompositionPlaylist`, `ffconcat`).
+- **Keep `FORMATS` in step with `media_ok`.** A castable type whose demuxer is missing from
+  the wrapper's list fails every transcode; add single-file demuxers only (never `hls`,
+  `dash`, `concat`, `image2`, `imf`).
