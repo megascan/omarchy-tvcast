@@ -1293,6 +1293,15 @@ ff_wrap() {
   FF_PATH=$dir:$PATH
 }
 
+# media_seconds <file>: the file's length in whole seconds, 0 when unknown.
+media_seconds() {
+  local formats d
+  formats=$(sed -n 's/^FORMATS=//p' "${SELF%/*}/tvcast-ffwrap" 2>/dev/null)
+  d=$(timeout 6 ffprobe -v error -protocol_whitelist file -format_whitelist "${formats:-mov,matroska,mpegts,avi,mpeg}" -show_entries format=duration -of csv=p=0 -- "$1" 2>/dev/null | head -n1)
+  [[ $d =~ ^([0-9]{1,9})(\.[0-9]*)?$ ]] || { echo 0; return; }
+  uint "${BASH_REMATCH[1]}"
+}
+
 # needs_transcode <video>: exit 0 when the TV likely can't play the video as is.
 needs_transcode() {
   local f=$1 e streams vcodec acodecs a formats
@@ -1715,15 +1724,20 @@ nap() { sleep "$1" & wait $!; } # interruptible by the TERM trap
 # seen, or go2tv quitting right after one): that is not the end of the file.
 # "Finished" is seen on the device, not from go2tv: STOPPED or
 # NO_MEDIA_PRESENT after it was PLAYING, or position reaching duration, on two
-# polls in a row. On Chromecast go2tv also exits by itself at the end, which
-# counts once playback was seen. On DLNA go2tv going away counts only when
-# the TV then reports STOPPED or NO_MEDIA_PRESENT (a stop on the TV ends the
-# file); a TV that is gone or stuck loading did not finish it. "blind" (a Chromecast without pychromecast) has no status at
-# all: go2tv exiting after 10 s or more counts as finished.
-# Images advance after TVCAST_IMAGE_SECONDS unless last.
+# polls in a row. On Chromecast go2tv also exits by itself at the end (1.5 s
+# before it), which counts only when the last status was near the end; any
+# earlier exit is a crash, not the end. On DLNA go2tv going away counts only
+# when the TV then reports STOPPED or NO_MEDIA_PRESENT (a stop on the TV ends
+# the file); a TV that is gone or stuck loading did not finish it. "blind" (a
+# Chromecast without pychromecast) has no status at all: go2tv exiting counts
+# as finished only after 10 s and, when the file's length is known, no earlier
+# than that length.
+# Images advance after TVCAST_IMAGE_SECONDS unless last; one the TV never
+# reported playing returns 4 (moved on, not seen), so it never counts as played.
 wait_item_end() {
-  local kind=$1 last=$2 blind=${3:-} saw=0 ends=0 others=0 t=0 st="" pos dur at_end served=""
+  local kind=$1 last=$2 blind=${3:-} saw=0 ends=0 others=0 t=0 st="" pos dur at_end served="" lpos=0 ldur=0 lt=0 lst="" flen=0
   local poll=${TVCAST_POLL_SECONDS:-2} start_timeout=${TVCAST_START_TIMEOUT:-90}
+  [[ -n $blind && $kind != image ]] && flen=$(media_seconds "$PLAY_FILE")
   while :; do
     nap "$poll"
     t=$((t + poll))
@@ -1731,7 +1745,10 @@ wait_item_end() {
       if ((saw)); then
         if [[ $ADEV_TYPE == chromecast ]]; then
           [[ $st == OTHER ]] && return 3
-          return 0
+          ((ends > 0)) && return 0
+          [[ $lst == PLAYING ]] && ((ldur > 0 && lpos + SECONDS - lt + 5 >= ldur)) && return 0
+          [[ $lst == PAUSED_PLAYBACK ]] && ((ldur > 0 && lpos + 5 >= ldur)) && return 0
+          return 2
         fi
         for _ in 1 2 3; do
           st=""
@@ -1741,8 +1758,10 @@ wait_item_end() {
         done
         return 2
       fi
-      [[ -n $blind ]] && ((t >= 10)) && return 0
-      return 1
+      [[ -n $blind ]] || return 1
+      ((t >= 10)) || return 1
+      ((flen == 0 || t + poll + 3 >= flen)) && return 0
+      return 2
     fi
     if [[ -n $blind ]]; then
       [[ $kind == image ]] && ((!last && t >= ${TVCAST_IMAGE_SECONDS:-10})) && return 0
@@ -1753,7 +1772,7 @@ wait_item_end() {
     read -r st pos dur < <(dev_status 2>/dev/null) || true
     at_end=0
     case $st in
-      PLAYING | PAUSED_PLAYBACK) saw=1 ;;
+      PLAYING | PAUSED_PLAYBACK) saw=1 lpos=$pos ldur=$dur lt=$SECONDS lst=$st ;;
       STOPPED | NO_MEDIA_PRESENT) ((saw)) && at_end=1 ;;
     esac
     if [[ $st == OTHER ]] && ((saw)); then others=$((others + 1)); else others=0; fi
@@ -1762,7 +1781,8 @@ wait_item_end() {
     if ((at_end)); then ends=$((ends + 1)); else ends=0; fi
     ((ends >= 2)) && return 0
     if [[ $kind == image ]] && ((!last && t >= ${TVCAST_IMAGE_SECONDS:-10})); then
-      return 0
+      ((saw)) && return 0
+      return 4
     fi
     ((!saw && t >= start_timeout)) && return 1
   done
@@ -1775,7 +1795,7 @@ ADVANCE="$KEYPOS"' keypos($k) as $p | if $p != null then .index = $p + 1 else . 
 cmd_run() {
   trap 'kill_player; unpin' EXIT
   trap 'exit 0' TERM INT
-  local q count idx item file fid key title kind tc args name url last blind="" rc first="" first_key="" played=0 failed=0
+  local q count idx item file fid key title kind tc args name url last blind="" rc first="" first_key="" played=0 failed=0 unseen=0
   export TVCAST_IN_RUNNER=1
   rm -rf -- "$CACHE_DIR"/play.*
   rm -f -- "$STATE_FILE".?????? "$CAST_MEDIA_FILE"
@@ -1800,7 +1820,11 @@ cmd_run() {
           { write_state '{"active":false}'; die "$SAVE_ERR"; }
         [[ $(jq '.index < (.items | length)' <<<"$Q_OLD") == true ]] && continue
         write_state '{"active":false}'
-        notify critical "Cast to TV" "None of the $failed queued $( ((failed == 1)) && echo item || echo items) could be played. The queue was kept. See $LOG_FILE"
+        if ((unseen > 0)); then
+          notify critical "Cast to TV" "Nothing in the queue was confirmed as played: $failed failed and the TV never reported showing $unseen $( ((unseen == 1)) && echo image || echo images). The queue was kept. See $LOG_FILE"
+        else
+          notify critical "Cast to TV" "None of the $failed queued $( ((failed == 1)) && echo item || echo items) could be played. The queue was kept. See $LOG_FILE"
+        fi
         exit 0
       fi
       # Clear only a queue that is still finished: an add may have landed since the read.
@@ -1906,6 +1930,8 @@ cmd_run() {
     fi
     if ((rc == 0)); then
       played=$((played + 1))
+    elif ((rc == 4)); then
+      unseen=$((unseen + 1))
     else
       failed=$((failed + 1))
       ((failed <= 3)) && notify normal "Cast to TV" "Couldn't play $title, skipping. See $LOG_FILE"
