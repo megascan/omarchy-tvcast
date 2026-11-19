@@ -13,7 +13,13 @@
 - **Keep one column grid.** The TV glyph, the queue numbers and the menu-row glyphs
   share `glyphColumn`, so every label in the panel starts at the same x.
 - **Keep untrusted text plain.** File names and TV names only go through `plain()`
-  and `Text.PlainText`. They are always single-line and elided.
+  and `Text.PlainText`. They are always single-line and elided. `plain()` removes
+  characters and turns line separators into spaces; it never remaps characters to
+  look-alikes. Rendering as `PlainText` is the safety step, not the cleaning.
+- **The bar coalesces seeks.** Wheel steps and drags collapse into one `seek` or
+  `seek-to` call per burst. An absolute seek (`seek-to`, from a drag) cancels any
+  pending relative one (`seek ±N`, from the wheel or ±30 s), so the last user intent wins.
+  Test: spin the wheel, then drag, then check the TV ends at the dragged position.
 - **Test long strings:** a very long title, a very long TV name, a markup-shaped
   title, and no TV at all.
 - **Before committing a UI change, screenshot every state:** idle with a known TV,
@@ -139,8 +145,10 @@
 - **"LAN" excludes this machine.** `lan_url` refuses every address on `ip -o addr`
   (including docker/libvirt bridges). A device advertising our own LAN IP would reach
   local services bound to 0.0.0.0. IPv6 is compared after `ipv6_full` expansion.
-- **Private data on disk is owner-only.** `bin/tvcast` runs with `umask 077` and
-  `chmod 700`s its cache and state dirs on every start (older installs made them 755).
+- **Private data on disk is owner-only.** `bin/tvcast` runs with `umask 077`. Before
+  any command that writes, it creates and `chmod 700`s its cache and state dirs (older
+  installs made them 755). Read-only commands (`list`, `status`, `active`, `has-queue`,
+  `notify-status`) create nothing, and a symlinked dir is never chmod'ed through the link.
   The queue, state and `session.log` name what the user watches. `install.sh` makes
   `plugin-backups/` 0700 too. Check with `stat` after a run under `umask 022`.
 - **Untrusted text must never look like an option.** `omarchy-notification-send` parses a

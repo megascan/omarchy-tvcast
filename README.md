@@ -88,7 +88,6 @@ no file contents:
 
 ```sh
 sudo ufw allow from <your-LAN>/24 to any port 3339:3438 proto udp   # tvcast's SSDP discovery replies
-sudo ufw allow from <your-LAN>/24 to any port 1900 proto udp        # SSDP
 sudo ufw allow from <your-LAN>/24 to any port 5353 proto udp        # mDNS (Chromecast)
 ```
 
@@ -98,6 +97,11 @@ address that faces the TV. Any machine that can reach that port can fetch the
 file during playback; the URL contains the file's name. That is how DLNA and
 Cast receivers fetch media, so it can't be avoided, only fenced in. Without a
 fixed TV address you can open `from <your-LAN>/24` instead, at that cost.
+
+Privacy: while a file is casting, go2tv's media server has no login. Anyone on
+your LAN, and any program on this machine that can reach the loopback port, can
+fetch the file during playback. go2tv has no access control to switch on; tvcast
+can't add one.
 
 ## Install
 
