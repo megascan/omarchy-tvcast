@@ -19,7 +19,14 @@
 - **The bar coalesces seeks.** Wheel steps and drags collapse into one `seek` or
   `seek-to` call per burst. An absolute seek (`seek-to`, from a drag) cancels any
   pending relative one (`seek ±N`, from the wheel or ±30 s), so the last user intent wins.
+  A drag made while a relative `seek` is still running waits for it (`pendingSeekTo`).
   Test: spin the wheel, then drag, then check the TV ends at the dragged position.
+- **Row actions carry the item key.** `play-index`, `move` and `remove` send the row's
+  position and its `key` from `status --json`; the CLI acts on the item with that key
+  wherever it is now, or on nothing if it is gone. Never send a bare position from a list
+  that may be stale.
+- **The volume row waits for a fresh reading.** It is greyed out after the panel opens
+  until a status reply with a boolean `volumeControl` arrives (`volumeFresh`).
 - **Test long strings:** a very long title, a very long TV name, a markup-shaped
   title, and no TV at all.
 - **Before committing a UI change, screenshot every state:** idle with a known TV,
@@ -87,8 +94,8 @@
   hangs for good on a Seek sent while PAUSED_PLAYBACK (LG_TRANSITIONING, actions = Stop
   only, every later Seek fails with 710, Play with 701; only Stop + Play recovers), and
   refuses seeks while TRANSITIONING (loading). A paused TV is sought with Play, wait for
-  PLAYING, Seek, Pause. Seeks are serialised by `seek.lock`. The bar's `canSeek` greys the
-  slider, ±30 s and scroll out while the TV is loading or stopped. Fake TVs used for seek
+  PLAYING, Seek, Pause. Seeks are coalesced (`coalesce`, below). The bar's `canSeek` greys the
+  slider, ±30 s and scroll out while the TV is loading or stopped, or another sender has it (OTHER). Fake TVs used for seek
   tests must hang on a paused Seek like the LG does.
 - **Volume goes through `dev_volume`, `dev_set_volume` and `dev_set_mute`.** DLNA uses
   RenderingControl (Channel Master). Its controlURL and SCPDURL come from `service_url`
@@ -306,18 +313,24 @@
   `$CACHE_DIR/verified`, since each check is an mDNS query).
   Test: change the fake TV's UDN, or plant another control URL in state.json, then press
   every control: no request may reach the other endpoint.
-- **A Cast session is ours only if this machine serves its media.** `tvcast-chromecast`
-  requires a go2tv receiver app id, a media session id, and a `content_id` whose host is the
-  local address used to reach the device (`own_address`). The media-namespace fallback is
-  gone: other apps expose that namespace too. Volume and mute are gated the same way.
+- **A Cast session is ours only if it plays the exact URL our go2tv serves.** The runner
+  finds the ports its own go2tv listens on (`served_ports`, via /proc) and writes
+  `<ports>/<name>` to `~/.cache/tvcast/cast-media`; `cast_helper` passes it as
+  `TVCAST_CAST_MEDIA`. `tvcast-chromecast` requires a go2tv receiver app id, a media
+  session id, and a `content_id` equal to `http://<own_address>:<port>/<quoted name>`. Any
+  other app or session reports `OTHER`, which never ends an item: `wait_item_end` returns 3
+  and the runner stops on that item ("Something else is now casting"). The media-namespace
+  fallback is gone: other apps expose that namespace too. Volume and mute are gated the same way.
   The helper refuses non-LAN addresses itself, not only through `cast_helper`.
-- **Count caps after the filters, and cap per sender.** A flood of junk SSDP replies or mDNS
-  records must not use up the slots a real TV needs. `tvcast-discover` counts only usable
-  replies (HTTP 200, a MediaRenderer/AVTransport ST, LOCATION host == source, no query or
-  fragment) toward 64, two per source address, and reads at most 4096 datagrams. `discover`
-  keeps two LOCATIONs per host, tries the known TV first and fetches with a 2 s connect
-  timeout. Chromecast rows: private IPv4 and port 8009 only; two records for one address
-  with different IDs give an empty ID (the picker opens) unless one is the saved ID.
+- **Cap after the whole window, known device first, then fairly.** Arrival order must never
+  decide which TV is kept. `tvcast-discover ssdp` collects usable replies (HTTP 200, a
+  MediaRenderer/AVTransport ST, LOCATION host == private source, no query or fragment) for
+  the whole window, prints the saved LOCATION (`--known`) first, then takes turns per /24
+  and per sender up to 64 (8 per host). `mdns` prints one row per (address, ID), drops
+  ID-less records for an address that has ID'd ones, and prints the saved ID first
+  (`--known URL ID`). `discover` caps DLNA (32) and Chromecast (64) rows separately, the
+  known device first. An address with several IDs is listed once per ID (label ends in
+  `· <id>`); the answer maps back by label and URL. Chromecast rows: private IPv4 and port 8009 only.
   Every per-record parse is inside its own try/except: one bad record never ends the scan.
 - **Bundled Python helpers run as `python3 -I <path>`** (`helper_argv`), so `PYTHONPATH`,
   `PYTHONSTARTUP` and the user site dir can't inject code. A `TVCAST_*_HELPER` override is
@@ -361,7 +374,26 @@
   `stop_runner` returns 1 then, and when `systemctl stop` fails. `stop`, `clear` and
   `_stop-owned` exit non-zero, send no Stop to the TV (a live runner would read it as
   "file finished") and leave state and queue alone. It only ever names tvcast's own units.
-- **One seek at a time, the latest wins.** `dlna_seek` writes the target to `seek.pending`
-  and returns if another seek holds `seek.lock`; the holder re-reads the target when done.
-  `dlna_wait_state` has a 12 s wall-clock limit, and a failed seek on a TV that was paused
-  is followed by Pause again.
+- **Coalesce requests, not targets.** Seeks and volume changes go through `coalesce
+  <kind> <request> <fn>`: one holder of `<kind>.lock` applies them; others merge their
+  request into `<kind>.pending` (under `<kind>.pending.lock`) and leave. `abs:N` replaces
+  what is pending, `rel:±N` adds to it, and the holder resolves a relative one against the
+  target it set last, so +30 sent during a drag to 50:00 lands at 50:30. One
+  `dlna_seek_once` has 10 s in total (`seek_left` caps each SOAP call's `-m`); the Pause
+  that puts a paused TV back is retried once and reported if it fails. `position_info`
+  fails on an unreadable RelTime, so a relative seek is refused rather than sent from 0.
+- **Every queue item has a key** (`r<hex>` from `items_json`; `p<pos>`/`d<pos>` for items
+  of older queues, saved at the runner start). `.playing` is the key of the item on screen;
+  `cur($act)` (jq) is the current position: that item while active, else `.index`. Row
+  commands take `[key]` and act on the item with that key (`ROWPOS`).
+- **Reads never write.** `list`, `status` and the rest of the read path compute from the
+  queue and state as they are; they never normalise or rewrite state.json or queue.json.
+- **A runner that is not ours stops nothing.** `foreign_runner` sees an active transient
+  `tvcast _run` unit we don't own; `stop_runner` returns 2 and `stop_or_die` tells the user
+  instead of starting a second runner beside it.
+- **Cast only files the user owns and only they can write.** `only_mine` (owner == UID, no
+  group/other write) is checked at add and again on the pinned fd. go2tv runs with
+  `$CACHE_DIR/ff` first on PATH: `ffmpeg`/`ffprobe` links to `bin/tvcast-ffwrap`, which
+  adds `-format_whitelist` (media demuxers only) to every local input, so a file rewritten
+  into a DASH manifest or HLS playlist after the checks can't make ffmpeg serve other files.
+  A NAS or synced folder where the mount shows the user as owner is covered only by the wrapper.

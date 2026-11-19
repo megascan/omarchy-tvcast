@@ -22,7 +22,8 @@ RenderingControl, or over the Cast protocol for a Chromecast.
 - **Queue:** moves to the next file when the TV reports the current one finished.
   Stopping it yourself never skips ahead, and the queue clears itself once the last file ends.
 - **DLNA and Chromecast:** the TV picker lists both, with each device's IP address
-  and type. A device you haven't picked before is never chosen for you.
+  and type. A device you haven't picked before is never chosen for you. When one
+  address announces several device IDs, each gets its own row ending in the ID.
 - **Format check (DLNA):** ffprobe decides whether a video needs transcoding. H.264, HEVC,
   MPEG-2 and MPEG-4 video in MP4, MKV, MOV, TS or AVI with AAC, AC3, EAC3 or MP3
   audio plays as-is. Everything else gets go2tv's ffmpeg transcode (`-tc`).
@@ -33,7 +34,9 @@ RenderingControl, or over the Cast protocol for a Chromecast.
 - **Files:** only local video, audio and image files are queued, judged by their
   content (`file --mime-type`), not their name. Torrent files, playlists (`.m3u`,
   `.pls`), SVG images, URLs and `-` are refused when you queue them, and checked
-  again right before each file plays.
+  again right before each file plays. So are files you don't own and files other
+  users can write to. When go2tv transcodes, its ffmpeg may only open the file as
+  a media container, never as a playlist or manifest that names other files.
 - **Images** stay on screen for 10 s (`TVCAST_IMAGE_SECONDS`), or until you stop if
   the image is last in the queue.
 - **Menu entries** (optional): Trigger › Cast to TV, also `omarchy menu summon cast`.
@@ -148,8 +151,9 @@ current file. If you close the TV picker, or no TV answers, the cast and its
 queue stay as they were. Choosing another TV with "Change TV" during a cast
 takes effect from the next cast. Pause, seek, volume and stop go to the TV the
 queue was started on, after the same device ID check; on a Chromecast they work
-only while it plays what this computer is serving, so they never touch another
-app or someone else's cast.
+only while it plays the exact file this computer's go2tv is serving, so they
+never touch another app or someone else's cast. If something else takes over
+the Chromecast, the queue stops on that file and tells you.
 
 If the TV stops answering in the middle of a file, the queue stops on that file
 and you get a notification; Play starts it again. If none of the queued files
