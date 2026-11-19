@@ -46,6 +46,7 @@ STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/tvcast
 QUEUE_FILE=$STATE_DIR/queue.json
 LOCK_FILE=$STATE_DIR/lock
 CC_STATUS_FILE=$CACHE_DIR/chromecast-status
+CAST_MEDIA_FILE=$CACHE_DIR/cast-media
 AVT=urn:schemas-upnp-org:service:AVTransport:1
 RCS=urn:schemas-upnp-org:service:RenderingControl:1
 RC_FILE=$CACHE_DIR/rendering
@@ -526,17 +527,69 @@ cast_ready() {
   "${HELPER[@]}" --check >/dev/null 2>&1
 }
 
+# The Cast session is tvcast's only if it plays the exact URL tvcast's own
+# go2tv serves. The runner finds the ports its go2tv listens on and writes
+# them with the served file name to CAST_MEDIA_FILE ("<ports>/<name>"), and
+# every helper call gets that as TVCAST_CAST_MEDIA. Without it no session is ours.
+cast_media() {
+  local line=""
+  [[ -s $CAST_MEDIA_FILE && ! -L $CAST_MEDIA_FILE ]] && IFS= read -r line <"$CAST_MEDIA_FILE"
+  [[ $line =~ ^[0-9]{1,5}(,[0-9]{1,5}){0,7}/[^/]+$ ]] && printf '%s\n' "$line"
+}
+
 cast_helper() { # cast_helper <device-url> status|pause|play|stop|seek <s>|volume <0-100>|mute on|off; exit 3: no pychromecast
-  local url=$1 host port
+  local url=$1 host port media
   shift
   lan_url "$url" || return 1
   read -r host port < <(url_hostport "$url") || return 1
   [[ -x $CAST_HELPER ]] || return 3
   helper_argv "$CAST_HELPER"
+  media=$(cast_media)
   (
     ulimit -v 1048576 2>/dev/null
-    exec timeout 15 "${HELPER[@]}" "$host" "$port" "$@"
+    TVCAST_CAST_MEDIA=$media exec timeout 15 "${HELPER[@]}" "$host" "$port" "$@"
   ) 2>/dev/null | head -c 4096
+}
+
+# served_ports <pid>: the TCP ports that <pid> and its descendants listen on
+# (go2tv's media server), comma-separated.
+served_ports() {
+  local p fd l ino hex port out=""
+  local -A inodes=()
+  while read -r p; do
+    [[ $p =~ ^[0-9]{1,9}$ ]] || continue
+    for fd in /proc/"$p"/fd/*; do
+      l=$(readlink -- "$fd" 2>/dev/null) || continue
+      [[ $l =~ ^socket:\[([0-9]{1,20})\]$ ]] && inodes[${BASH_REMATCH[1]}]=1
+    done
+  done < <(ps -e -o pid=,ppid= 2>/dev/null | awk -v root="$1" '
+    { kids[$2] = kids[$2] " " $1 }
+    END {
+      q[1] = root; n = 1
+      for (i = 1; i <= n && i <= 256; i++) {
+        print q[i]
+        m = split(kids[q[i]], c, " ")
+        for (j = 1; j <= m; j++) q[++n] = c[j]
+      }
+    }')
+  ((${#inodes[@]})) || return 1
+  while read -r hex ino; do
+    [[ $hex =~ ^[0-9A-F]{4}$ && -n ${inodes[$ino]:-} ]] || continue
+    port=$((16#$hex))
+    [[ ,$out, == *,$port,* ]] || out+=${out:+,}$port
+  done < <(awk '$4 == "0A" { split($2, a, ":"); print a[length(a)], $10 }' /proc/net/tcp /proc/net/tcp6 2>/dev/null)
+  [[ -n $out ]] && printf '%s\n' "$out"
+}
+
+# note_served <pid> <name>: writes CAST_MEDIA_FILE once go2tv listens.
+note_served() {
+  local ports tmp
+  ports=$(served_ports "$1") || return 1
+  [[ $2 != */* && -n $2 ]] || return 1
+  tmp=$(mktemp "$CAST_MEDIA_FILE.XXXXXX" 2>/dev/null) || return 1
+  if printf '%s/%s\n' "$ports" "$2" >"$tmp" && mv -f -- "$tmp" "$CAST_MEDIA_FILE"; then return 0; fi
+  rm -f -- "$tmp"
+  return 1
 }
 
 # cc_line: the helper's raw status line "<STATE> <pos> <dur> <vol> <muted>"
@@ -1432,7 +1485,9 @@ kill_player() {
 nap() { sleep "$1" & wait $!; } # interruptible by the TERM trap
 
 # wait_item_end <kind> <is-last> [blind]: 0 when the item finished, 1 when it
-# never started, 2 when the TV stopped answering in the middle of it.
+# never started, 2 when the TV stopped answering in the middle of it, 3 when
+# another sender or app took the Chromecast over (OTHER after playback was
+# seen, or go2tv quitting right after one): that is not the end of the file.
 # "Finished" is seen on the device, not from go2tv: STOPPED or
 # NO_MEDIA_PRESENT after it was PLAYING, or position reaching duration, on two
 # polls in a row. On Chromecast go2tv also exits by itself at the end, which
@@ -1442,14 +1497,17 @@ nap() { sleep "$1" & wait $!; } # interruptible by the TERM trap
 # all: go2tv exiting after 10 s or more counts as finished.
 # Images advance after TVCAST_IMAGE_SECONDS unless last.
 wait_item_end() {
-  local kind=$1 last=$2 blind=${3:-} saw=0 ends=0 t=0 st pos dur at_end
+  local kind=$1 last=$2 blind=${3:-} saw=0 ends=0 others=0 t=0 st="" pos dur at_end served=""
   local poll=${TVCAST_POLL_SECONDS:-2} start_timeout=${TVCAST_START_TIMEOUT:-90}
   while :; do
     nap "$poll"
     t=$((t + poll))
     if ! kill -0 "$PLAYER_PID" 2>/dev/null; then
       if ((saw)); then
-        [[ $ADEV_TYPE == chromecast ]] && return 0
+        if [[ $ADEV_TYPE == chromecast ]]; then
+          [[ $st == OTHER ]] && return 3
+          return 0
+        fi
         for _ in 1 2 3; do
           st=""
           read -r st _ < <(dev_status 2>/dev/null) || true
@@ -1465,6 +1523,7 @@ wait_item_end() {
       [[ $kind == image ]] && ((!last && t >= ${TVCAST_IMAGE_SECONDS:-10})) && return 0
       continue
     fi
+    if [[ $ADEV_TYPE == chromecast && -z $served ]] && note_served "$PLAYER_PID" "${PLAY_FILE##*/}"; then served=1; fi
     st="" pos=0 dur=0
     read -r st pos dur < <(dev_status 2>/dev/null) || true
     at_end=0
@@ -1472,6 +1531,8 @@ wait_item_end() {
       PLAYING | PAUSED_PLAYBACK) saw=1 ;;
       STOPPED | NO_MEDIA_PRESENT) ((saw)) && at_end=1 ;;
     esac
+    if [[ $st == OTHER ]] && ((saw)); then others=$((others + 1)); else others=0; fi
+    ((others >= 2)) && return 3
     [[ $st == PLAYING ]] && ((saw && dur > 2 && pos >= dur - 1)) && at_end=1
     if ((at_end)); then ends=$((ends + 1)); else ends=0; fi
     ((ends >= 2)) && return 0
@@ -1488,7 +1549,7 @@ cmd_run() {
   local q count idx item file fid title kind tc args name url last blind="" rc first="" played=0 failed=0
   export TVCAST_IN_RUNNER=1
   rm -rf -- "$CACHE_DIR"/play.*
-  rm -f -- "$STATE_FILE".??????
+  rm -f -- "$STATE_FILE".?????? "$CAST_MEDIA_FILE"
   while :; do
     q=$(q_read)
     count=$(uint "$(jq '.items | length' <<<"$q")")
@@ -1592,10 +1653,15 @@ cmd_run() {
     wait_item_end "$kind" "$last" "$blind" || rc=$?
     kill_player
     unpin
+    rm -f -- "$CAST_MEDIA_FILE"
     if ((rc == 2)); then
       # The item did not finish: keep the queue on it.
       write_state '{"active":false}'
       die "$name stopped answering or got stuck while $title was playing. Press Play to start it again."
+    fi
+    if ((rc == 3)); then
+      write_state '{"active":false}'
+      die "Something else is now casting to $name, so $title was stopped there. Press Play to cast it again."
     fi
     if ((rc == 0)); then
       played=$((played + 1))
@@ -1781,7 +1847,7 @@ cmd_clear() {
 cmd_cleanup() { # ExecStopPost: tell the TV to stop, mark idle
   state_active && dev_control stop >/dev/null 2>&1
   write_state '{"active":false}'
-  rm -f "$CC_STATUS_FILE"
+  rm -f "$CC_STATUS_FILE" "$CAST_MEDIA_FILE"
 }
 
 cmd_stop() { # stop playback, keep the queue (play resumes at the same item)
