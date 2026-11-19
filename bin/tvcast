@@ -1274,16 +1274,36 @@ open_regular() {
   return 1
 }
 
+# ff_wrap: go2tv's ffmpeg and ffprobe are bin/tvcast-ffwrap (links in
+# $CACHE_DIR/ff, first on go2tv's PATH), which let a local input be opened by
+# media demuxers only. Pinning fixes which file go2tv reads, not what is in it:
+# a file rewritten into a DASH manifest or HLS playlist after it was checked
+# would make ffmpeg serve other local files it names. Sets FF_PATH.
+FF_PATH=$PATH
+ff_wrap() {
+  local dir=$CACHE_DIR/ff real probe wrap=${SELF%/*}/tvcast-ffwrap
+  FF_PATH=$PATH
+  real=$(command -v ffmpeg) || return 0
+  [[ $real == /* ]] || return 0
+  probe=$(command -v ffprobe) || probe=${real%/*}/ffprobe
+  [[ -x $wrap ]] || return 1
+  rm -rf -- "$dir" && mkdir -m 700 -- "$dir" || return 1
+  ln -s -- "$wrap" "$dir/ffmpeg" && ln -s -- "$wrap" "$dir/ffprobe" || return 1
+  export TVCAST_FFMPEG=$real TVCAST_FFPROBE=$probe
+  FF_PATH=$dir:$PATH
+}
+
 # needs_transcode <video>: exit 0 when the TV likely can't play the video as is.
 needs_transcode() {
-  local f=$1 e streams vcodec acodecs a
+  local f=$1 e streams vcodec acodecs a formats
   case ${TVCAST_TRANSCODE:-auto} in
     always) return 0 ;;
     never) return 1 ;;
   esac
   e=$(ext_of "$f")
   [[ $OK_CONTAINERS == *" $e "* ]] || return 0
-  streams=$(timeout 6 ffprobe -v error -protocol_whitelist file -show_entries stream=codec_type,codec_name -of csv=p=0 -- "$f" 2>/dev/null) || return 0
+  formats=$(sed -n 's/^FORMATS=//p' "${SELF%/*}/tvcast-ffwrap" 2>/dev/null)
+  streams=$(timeout 6 ffprobe -v error -protocol_whitelist file -format_whitelist "${formats:-mov,matroska,mpegts,avi,mpeg}" -show_entries stream=codec_type,codec_name -of csv=p=0 -- "$f" 2>/dev/null) || return 0
   vcodec=$(awk -F, '$2 == "video" {print $1; exit}' <<<"$streams")
   [[ -n $vcodec && $OK_VCODECS == *" $vcodec "* ]] || return 0
   acodecs=$(awk -F, '$2 == "audio" {print $1}' <<<"$streams")
@@ -1343,6 +1363,10 @@ pin_media() {
   p=/proc/$BASHPID/fd/$MEDIA_FD
   PIN_ERR="the file was replaced or changed since it was queued (or its drive was remounted). Add it again."
   [[ $(file_id "$p") == "$want" ]] || { unpin; return 1; }
+  # Someone else who can rewrite it could turn it into anything after the
+  # checks below (see ff_wrap).
+  PIN_ERR="someone other than you can change it. Cast only files you own and only you can write to."
+  only_mine "$p" || { unpin; return 1; }
   mime=$(mime_of "$p")
   PIN_ERR="it is not a video, audio or image file."
   media_ok "$file" "$mime" || { unpin; return 1; }
@@ -1478,8 +1502,15 @@ q_index() { uint "$(q_get '.index')"; }
 # are read from the opened file, and the item is kept only if that file still
 # is the one the path named: a path swapped for a link in between would
 # otherwise put another file's ID under the picked name.
+# only_mine <path>: the file is the user's and no one else can write to it.
+only_mine() {
+  local owner="" mode=""
+  read -r owner mode < <(stat -L -c '%u %a' -- "$1" 2>/dev/null)
+  [[ $owner == "$UID" && $mode =~ ^[0-7]{1,4}$ ]] && ! ((8#$mode & 8#022))
+}
+
 items_json() {
-  local f p real mime id title
+  local f p real mime id title mine
   for f in "$@"; do
     if [[ $f == - || $f == *://* || ${f,,} == magnet:* ]]; then
       echo "tvcast: skipping $(clean_text 300 <<<"$f") (not a local file)" >&2
@@ -1495,6 +1526,8 @@ items_json() {
     IFS= read -r -d '' real < <(readlink -z -- "$p" 2>/dev/null)
     mime=$(mime_of "$p")
     id=$(file_id "$p")
+    mine=1
+    only_mine "$p" || mine=""
     exec {OPEN_FD}<&-
     if [[ $real != "$f" ]]; then
       echo "tvcast: skipping $(clean_text 300 <<<"$f") (it changed while it was being added)" >&2
@@ -1506,6 +1539,10 @@ items_json() {
     fi
     if [[ -z $id ]] || ! media_ok "$f" "$mime"; then
       echo "tvcast: skipping $(clean_text 300 <<<"$f") (not a video, audio or image file)" >&2
+      continue
+    fi
+    if [[ -z $mine ]]; then
+      echo "tvcast: skipping $(clean_text 300 <<<"$f") (someone other than you can change it)" >&2
       continue
     fi
     title=${f##*/}
@@ -1742,6 +1779,7 @@ cmd_run() {
   export TVCAST_IN_RUNNER=1
   rm -rf -- "$CACHE_DIR"/play.*
   rm -f -- "$STATE_FILE".?????? "$CAST_MEDIA_FILE"
+  ff_wrap || { write_state '{"active":false}'; die "Could not set up $CACHE_DIR/ff for go2tv's ffmpeg."; }
   # Saves the item keys (a queue from an older version has none yet), and
   # nothing is on screen until the first item starts.
   q_update '.playing = null' || { write_state '{"active":false}'; die "$SAVE_ERR"; }
@@ -1849,7 +1887,7 @@ cmd_run() {
       notify low "Casting to $name" "$title"
     fi
 
-    SHELL=/bin/bash setsid script -qfec "$(printf '%q ' "$GO2TV" "${args[@]}")" "$LOG_FILE" </dev/null >/dev/null 2>&1 &
+    SHELL=/bin/bash PATH=$FF_PATH setsid script -qfec "$(printf '%q ' "$GO2TV" "${args[@]}")" "$LOG_FILE" </dev/null >/dev/null 2>&1 &
     PLAYER_PID=$!
 
     rc=0
