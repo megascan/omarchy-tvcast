@@ -19,7 +19,7 @@
 #   tvcast stop                      stop playback, keep the queue
 #   tvcast volume [N|+N|-N|up|down]  TV volume 0-100 (no argument: print it)
 #   tvcast mute [on|off|toggle]      mute the TV (default: toggle)
-#   tvcast status [--json]           now playing (+ TV state and position)
+#   tvcast status [--json [--volume]] now playing (+ TV state, position, volume)
 #   tvcast devices [--json]          discover TVs and Chromecasts (a few seconds)
 #   tvcast pick-device               discover and choose the TV to cast to
 #   tvcast active | has-queue [min]  exit 0 while casting / while queued
@@ -555,10 +555,26 @@ cc_line() {
 }
 
 cc_status() { # "<STATE> <pos> <dur>"
+  local line
+  line=$(cc_line) || return 1
+  cc_status_of "$line"
+}
+
+cc_status_of() { # cc_status_of <cc_line output>: "<STATE> <pos> <dur>"
   local st pos dur _
-  read -r st pos dur _ < <(cc_line) || return 1
+  read -r st pos dur _ <<<"$1" || return 1
   [[ $st =~ ^[A-Z_]{1,32}$ ]] || return 1
   printf '%s %s %s\n' "$st" "$(uint "$pos")" "$(uint "$dur")"
+}
+
+cc_volume_of() { # cc_volume_of <cc_line output>: "<0-100> <0|1 muted>"
+  local vol muted _
+  read -r _ _ _ vol muted <<<"$1" || return 1
+  [[ $vol =~ ^[0-9]{1,3}$ ]] || return 1
+  vol=$(uint "$vol")
+  ((vol > 100)) && vol=100
+  [[ $muted == 1 ]] || muted=0
+  echo "$vol $muted"
 }
 
 # active_type: backend of the active device (from its address, as go2tv routes it).
@@ -761,12 +777,9 @@ rc_soap() { # rc_soap <control-url> <action> [inner-xml]
 dev_volume() {
   local vol muted ctl max raw m
   if [[ $(active_type) == chromecast ]]; then
-    read -r _ _ _ vol muted < <(cc_line) || return 1
-    [[ $vol =~ ^[0-9]{1,3}$ ]] || return 1
-    vol=$(uint "$vol")
-    ((vol > 100)) && vol=100
-    [[ $muted == 1 ]] || muted=0
-    echo "$vol $muted"
+    local line
+    line=$(cc_line) || return 1
+    cc_volume_of "$line"
     return
   fi
   rc_get || return 1
@@ -1804,7 +1817,8 @@ cmd_seek_to() {
 }
 
 # list: queue plus now-playing, no network calls. status --json adds the TV's
-# transport state and position while casting.
+# transport state and position while casting, and --volume its volume and mute
+# (always on Chromecast, where they come in the same status line).
 cmd_list() {
   local active=false st="" last=""
   [[ -s $DEVICE_FILE ]] && last=$(cut -f1 "$DEVICE_FILE")
@@ -1825,24 +1839,30 @@ cmd_list() {
 }
 
 cmd_status() {
-  local json=${1:-} st="" pos=0 dur=0 list vol=-1 muted=0
+  local json=${1:-} withvol=false st="" pos=0 dur=0 list vol=-1 muted=0 line="" posok=false
+  [[ $json == --json && ${2:-} == --volume ]] && withvol=true
   adev
   list=$(cmd_list)
   if [[ $(jq -r .active <<<"$list") == true ]]; then
     if [[ $(active_type) == chromecast ]]; then
-      read -r st pos dur < <(cc_status 2>/dev/null) || true
+      line=$(cc_line 2>/dev/null) || line=""
+      [[ $json == --json ]] && withvol=true
+      read -r st pos dur < <(cc_status_of "$line") && posok=true
+      [[ $withvol == true && $posok == true ]] && { read -r vol muted < <(cc_volume_of "$line") || vol=-1; }
     else
       st=$(transport_state 2>/dev/null)
-      [[ $st == UNKNOWN ]] || read -r pos dur < <(position_info 2>/dev/null) || true
+      [[ $st == UNKNOWN ]] || { read -r pos dur < <(position_info 2>/dev/null) && posok=true; }
+      [[ $withvol == true && $posok == true ]] && { read -r vol muted < <(dev_volume 2>/dev/null) || vol=-1; }
     fi
-    [[ $json == --json && $st != UNKNOWN ]] && { read -r vol muted < <(dev_volume 2>/dev/null) || vol=-1; }
   fi
   if [[ $json == --json ]]; then
     vol=$( [[ $vol =~ ^[0-9]{1,3}$ ]] && uint "$vol" || echo -1)
     jq -c --arg st "$st" --argjson pos "${pos:-0}" --argjson dur "${dur:-0}" \
       --argjson vol "$vol" --argjson muted "$( [[ ${muted:-0} == 1 ]] && echo true || echo false)" \
+      --argjson read "$withvol" \
       '. + {transport: $st, position: $pos, duration: $dur,
-            volumeControl: ($vol >= 0), volume: (if $vol >= 0 then $vol else null end), muted: $muted}' <<<"$list"
+            volumeControl: (if $read then $vol >= 0 else null end),
+            volume: (if $vol >= 0 then $vol else null end), muted: $muted}' <<<"$list"
   elif [[ $(jq -r .active <<<"$list") == true ]]; then
     jq -r --arg st "${st:-UNKNOWN}" --arg p "$(s_to_hms "${pos:-0}")" --arg d "$(s_to_hms "${dur:-0}")" \
       '"\(.title) (\(.index + 1)/\(.count)) on \(.deviceName): \($st) \($p) / \($d)"' <<<"$list"

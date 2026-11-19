@@ -164,7 +164,7 @@ tvcast next | prev | play-index N | remove N | move N up|down | clear | list
 tvcast play | toggle | pause | resume | stop
 tvcast seek +30 | seek -30 | seek 1:02:03 | seek-to <seconds>
 tvcast volume [N|+N|-N|up|down] | mute [on|off|toggle]
-tvcast status [--json] | devices [--json] | pick-device
+tvcast status [--json [--volume]] | devices [--json] | pick-device
 ```
 
 Playback runs as the transient user service `megascan-tvcast.service` (created with

@@ -8,6 +8,7 @@ import qs.Ui
 // Bar widget and queue manager for tvcast. Idle, it is just a cast icon. It
 // watches tvcast's state files (no timers while idle) and polls
 // `tvcast status --json` while a cast is running (2 s with the panel open, 10 s closed).
+// Volume and mute are read only while the panel is open or a volume change is settling.
 //   Left click: open the queue panel   Middle click: pause/resume
 //   Right click: stop (while casting)  Scroll: seek 30 seconds
 BarWidget {
@@ -117,11 +118,13 @@ BarWidget {
     root.position = root.casting ? (Number(d.position) || 0) : 0
     root.duration = root.casting ? (Number(d.duration) || 0) : 0
     if (root.seekTarget >= 0 && (!root.casting || Math.abs(root.position - root.seekTarget) <= 3)) root.seekTarget = -1
-    root.volumeControl = root.casting && d.volumeControl === true
-    root.volume = root.volumeControl ? Math.max(0, Math.min(100, Number(d.volume) || 0)) : 0
-    root.muted = root.volumeControl && d.muted === true
-    if (root.volumeTarget >= 0 && !volumeSend.running && (!root.volumeControl || Math.abs(root.volume - root.volumeTarget) <= 1)) root.volumeTarget = -1
-    if (root.muteTarget >= 0 && (!root.volumeControl || (root.muteTarget === 1) === root.muted)) root.muteTarget = -1
+    if (!root.casting || typeof d.volumeControl === "boolean") {
+      root.volumeControl = root.casting && d.volumeControl === true
+      root.volume = root.volumeControl ? Math.max(0, Math.min(100, Number(d.volume) || 0)) : 0
+      root.muted = root.volumeControl && d.muted === true
+      if (root.volumeTarget >= 0 && !volumeSend.running && (!root.volumeControl || Math.abs(root.volume - root.volumeTarget) <= 1)) root.volumeTarget = -1
+      if (root.muteTarget >= 0 && (!root.volumeControl || (root.muteTarget === 1) === root.muted)) root.muteTarget = -1
+    }
   }
 
   // One SetVolume per pause in dragging or scrolling (150 ms), not per step.
@@ -181,8 +184,10 @@ BarWidget {
   }
 
   function refresh() {
-    if (statusProcess.running) root.refreshPending = true
-    else statusProcess.running = true
+    if (statusProcess.running) { root.refreshPending = true; return }
+    var withVolume = root.popupOpen || root.volumeTarget >= 0 || root.muteTarget >= 0
+    statusProcess.command = [root.tvcast, "status", "--json"].concat(withVolume ? ["--volume"] : [])
+    statusProcess.running = true
   }
 
   // Runs the bundled CLI as an argv vector through a login shell (for the
@@ -210,7 +215,6 @@ BarWidget {
 
   Process {
     id: statusProcess
-    command: [root.tvcast, "status", "--json"]
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.applyStatus(text) }
     onExited: if (root.refreshPending) { root.refreshPending = false; Qt.callLater(root.refresh) }
   }

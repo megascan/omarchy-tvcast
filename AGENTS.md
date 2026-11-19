@@ -99,7 +99,9 @@
   Volume maximum. Test with a fake TV whose RenderingControl controlURL (absolute, octal,
   or via URLBase) points elsewhere, plus a hand-edited cache: no request may leave.
   The bar's volume slider is optimistic (`volumeTarget`/`muteTarget`) and sends one
-  `tvcast volume` per 150 ms pause in dragging or scrolling. Epoch seconds are 10 digits:
+  `tvcast volume` per 150 ms pause in dragging or scrolling. `status --json` reads only
+  transport and position (2 requests); DLNA volume and mute come only with `--volume`, which the
+  bar passes while the panel is open or a volume/mute change is settling. Epoch seconds are 10 digits:
   never pass them through `uint` (9 digits max), compare them in jq.
 - **Chromecast control is `bin/tvcast-chromecast` (python-pychromecast, optional).** Call it
   only through `cast_helper`, which enforces a LAN IP, `timeout`, `ulimit -v` (Cast frames
