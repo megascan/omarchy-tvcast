@@ -6,6 +6,7 @@
     tvcast-discover mdns [seconds] [--only URL] [--known URL ID]
                                       prints "<name><TAB>http://<ip>:<port><TAB>chromecast<TAB><id>"
                                       (--only: just the records for that address)
+Exit 4: avahi could not be browsed (not running, or it hung with no output).
 
 Nothing here makes an HTTP request. tvcast validates every address it prints
 (private LAN IP, not this machine, LOCATION on the replying host) and only
@@ -51,6 +52,7 @@ MAX_DATAGRAM = 2048
 MAX_LOCATION = 512
 MAX_RECORDS = 128
 MAX_PER_URL = 4
+EXIT_BROWSE_FAILED = 4
 CAST_PORT = 8009
 LAN_NETS = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")]
 PORTS = range(3339, 3439)
@@ -246,15 +248,25 @@ def port_number(text):
     return int(text) if text.isascii() and text.isdigit() and len(text) <= 5 else None
 
 
+class BrowseFailed(Exception):
+    pass
+
+
 def mdns_avahi(seconds, out):
     try:
         res = subprocess.run(
             ["avahi-browse", "-rtpk", "_googlecast._tcp"],
             capture_output=True, timeout=seconds + 2, check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as e:
-        stdout = getattr(e, "stdout", None) or b""
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout or b""
+        if not stdout:
+            raise BrowseFailed from e
+    except OSError as e:
+        raise BrowseFailed from e
     else:
+        if res.returncode != 0:
+            raise BrowseFailed
         stdout = res.stdout
     for line in stdout[:262144].decode("utf-8", "replace").splitlines():
         f = line.split(";", 9)
@@ -360,7 +372,11 @@ def main(argv):
     if argv[1] == "ssdp":
         ssdp(seconds, known or None)
     else:
-        mdns(seconds, only or None, known if known and known[0] else None)
+        try:
+            mdns(seconds, only or None, known if known and known[0] else None)
+        except BrowseFailed:
+            print("tvcast-discover: could not browse mDNS (is avahi running?)", file=sys.stderr)
+            return EXIT_BROWSE_FAILED
     return 0
 
 
