@@ -387,7 +387,7 @@ device_id() { # device_id <url> [saved-id]
   local url=$1 want=${2:-} xml ids
   lan_url "$url" || return 1
   if [[ $(url_type "$url") == chromecast ]]; then
-    ids=$(python3 -I "$DISCOVER_HELPER" mdns 2 "$url" 2>/dev/null |
+    ids=$(python3 -I "$DISCOVER_HELPER" mdns 2 --only "$url" --known "$url" "$want" 2>/dev/null |
       awk -F'\t' -v u="$url" '$2 == u && $4 != "" {print $4}' | sort -u)
     [[ -n $ids ]] || return 1
     if [[ $ids == *$'\n'* ]]; then
@@ -455,9 +455,11 @@ adev() {
 # every time (one description fetch).
 VERIFIED_TTL=20
 verified_recently() {
-  local age line
+  local age line now mtime
   [[ -s $VERIFIED_FILE ]] || return 1
-  age=$(($(date +%s) - $(uint "$(stat -c %Y "$VERIFIED_FILE" 2>/dev/null)")))
+  now=$(date +%s) mtime=$(stat -c %Y "$VERIFIED_FILE" 2>/dev/null)
+  [[ $now =~ ^[0-9]{1,12}$ && $mtime =~ ^[0-9]{1,12}$ ]] || return 1
+  age=$((10#$now - 10#$mtime))
   ((age >= 0 && age <= VERIFIED_TTL)) || return 1
   IFS= read -r line <"$VERIFIED_FILE"
   [[ $line == "$ADEV_URL"$'\t'"$ADEV_ID" ]]
@@ -841,33 +843,55 @@ dev_set_mute() { # dev_set_mute 0|1
 # LOCATION must be on the host that sent the reply, BEFORE anything is fetched.
 # The surviving descriptions are then fetched with the capped CURL, a few at
 # a time. TVCAST_SCAN_SECONDS sets how long to listen (default 4).
-# Caps are applied after the filters and per host, and the TV picked last
-# time goes first, so one LAN host can't crowd a real TV out of the list or
-# stretch the scan: at most MAX_PER_HOST descriptions per replying host, no
-# LOCATION with a query or fragment (a reply's source address can be forged,
-# so a LOCATION is a request someone else chose), MAX_DEVICES in total.
-# One address announcing several Chromecast IDs is listed without an ID,
-# unless one of them is the saved one.
+# Caps are applied after the filters, and the TV picked last time goes first,
+# so LAN hosts can't crowd a real TV out of the list or stretch the scan. The
+# helper collects the whole window and hands out LOCATIONs in turns (per /24,
+# then per sender, at most MAX_PER_HOST each); no LOCATION with a query or
+# fragment (a reply's source address can be forged, so a LOCATION is a request
+# someone else chose); MAX_DEVICES descriptions are fetched. Chromecast rows
+# cost nothing to announce, so they have their own cap (MAX_CAST_ROWS) after
+# the fetched DLNA rows. Every ID announced at a Chromecast address is its own
+# row (the menu shows the ID when an address has several), and the saved one
+# is always kept.
 DISCOVER_HELPER=${SELF%/*}/tvcast-discover
 MAX_DEVICES=32
-MAX_PER_HOST=2
-discover() {
-  local secs=${TVCAST_SCAN_SECONDS:-4} dir src loc i=0 f name url tag id known="" kid=""
+MAX_CAST_ROWS=64
+
+# known_device: sets KNOWN_URL and KNOWN_ID, the TV picked last time (the
+# device file, else the queue's device).
+KNOWN_URL="" KNOWN_ID=""
+known_device() {
+  local _n
+  KNOWN_URL="" KNOWN_ID=""
+  [[ -s $DEVICE_FILE ]] && IFS=$'\t' read -r _n KNOWN_URL KNOWN_ID <"$DEVICE_FILE"
+  if [[ -z $KNOWN_URL ]]; then
+    KNOWN_URL=$(q_get '.device.url // empty | strings')
+    KNOWN_ID=$(q_get '.device.id // empty | strings')
+  fi
+  lan_url "$KNOWN_URL" || KNOWN_URL=""
+  [[ $KNOWN_ID =~ $DEV_ID_RE ]] || KNOWN_ID=""
+}
+
+discover() { # discover [known-url known-id]
+  local secs=${TVCAST_SCAN_SECONDS:-4} dir src loc i=0 f name url tag id known=${1:-} kid=${2:-}
+  local margs=() sargs=()
   [[ $secs =~ ^[0-9]{1,2}$ ]] || secs=4
   dir=$(mktemp -d "$CACHE_DIR/scan.XXXXXX") || return 1
-  [[ -s $DEVICE_FILE ]] && IFS=$'\t' read -r _ known kid <"$DEVICE_FILE"
-  python3 -I "$DISCOVER_HELPER" mdns "$secs" >"$dir/mdns" 2>/dev/null &
-  python3 -I "$DISCOVER_HELPER" ssdp "$secs" 2>/dev/null |
+  [[ $kid =~ $DEV_ID_RE ]] || kid=""
+  if [[ $(url_type "$known") == chromecast && -n $kid ]]; then margs=(--known "$known" "$kid"); fi
+  if [[ -n $known && $(url_type "$known") == dlna ]]; then sargs=(--known "$known"); fi
+  python3 -I "$DISCOVER_HELPER" mdns "$secs" "${margs[@]}" >"$dir/mdns" 2>/dev/null &
+  python3 -I "$DISCOVER_HELPER" ssdp "$secs" "${sargs[@]}" 2>/dev/null |
     while IFS=$'\t' read -r src loc; do
       lan_url "$loc" || continue
       [[ $loc != *[?#]* ]] || continue
       [[ $(url_type "$loc") == dlna ]] || continue
       [[ $(url_host "$loc") == "$src" ]] || continue # LOCATION must be the replying host
       printf '%s\t%s\n' "$src" "$loc"
-    done | awk -F'\t' -v known="$known" -v per="$MAX_PER_HOST" -v max="$MAX_DEVICES" '
+    done | awk -F'\t' -v known="$known" -v max="$MAX_DEVICES" '
       seen[$2]++ { next }
       $2 == known { first = $2; next }
-      n[$1]++ < per { rest[++r] = $2 }
+      { rest[++r] = $2 }
       END {
         if (first != "") { print first; max-- }
         for (j = 1; j <= r && j <= max; j++) print rest[j]
@@ -890,7 +914,7 @@ discover() {
   for f in "$dir"/dlna.*; do
     [[ -s $f ]] && head -n 1 "$f"
   done >"$dir/found"
-  [[ -s $dir/mdns ]] && head -n $((MAX_DEVICES * 4)) "$dir/mdns" >>"$dir/found"
+  [[ -s $dir/mdns ]] && head -n 256 "$dir/mdns" >>"$dir/found"
   while IFS=$'\t' read -r name url tag id; do
     lan_url "$url" || continue
     [[ $id =~ $DEV_ID_RE ]] || id=""
@@ -902,29 +926,24 @@ discover() {
     name=$(clean_text 120 <<<"$name")
     [[ -n $name ]] || name=TV
     printf '%s\t%s\t%s\t%s\n' "$name" "$url" "$tag" "$id"
-  done <"$dir/found" | LC_ALL=C sort -t $'\t' -k2,2 -k1,1 -k4,4 |
-    awk -F'\t' -v OFS='\t' -v known="$known" -v kid="$kid" -v max="$MAX_DEVICES" '
-      {
-        u = $2
-        if (!(u in name)) { order[++n] = u; name[u] = $1; type[u] = $3; id[u] = $4 }
-        else if ($4 != id[u] && !(u in fixed)) id[u] = ""
-        if (u == known && kid != "" && $4 == kid) { name[u] = $1; id[u] = $4; fixed[u] = 1 }
-      }
+  done <"$dir/found" | LC_ALL=C sort -t $'\t' -k2,2 -k4,4 -k1,1 |
+    awk -F'\t' -v OFS='\t' -v known="$known" -v kid="$kid" -v dmax="$MAX_DEVICES" -v cmax="$MAX_CAST_ROWS" '
+      seen[$2 FS $4]++ { next }
+      $3 == "dlna" && dseen[$2]++ { next }
+      $2 == known && ($3 == "dlna" || $4 == kid) { print; next }
+      $3 == "dlna" { if (nd++ < dmax) dl[nd] = $0; next }
+      { if (nc++ < cmax) cc[nc] = $0 }
       END {
-        if (known in name) { print name[known], known, type[known], id[known]; max-- }
-        for (j = 1; j <= n && max > 0; j++) {
-          u = order[j]
-          if (u == known) continue
-          print name[u], u, type[u], id[u]
-          max--
-        }
+        for (j = 1; j <= nd && j <= dmax; j++) print dl[j]
+        for (j = 1; j <= nc && j <= cmax; j++) print cc[j]
       }'
   rm -rf "$dir"
 }
 
 cmd_devices() {
   local list
-  list=$(discover)
+  known_device
+  list=$(discover "$KNOWN_URL" "$KNOWN_ID")
   if [[ ${1:-} == --json ]]; then
     jq -Rn '[inputs | split("\t") | select(length == 4) | {name: .[0], url: .[1], type: .[2], id: .[3]}]' <<<"$list"
   else
@@ -947,21 +966,21 @@ url_host() {
 # without --pick, discovery only auto-selects a device at the exact description
 # URL we already know that also reports the saved ID; anything else (a single
 # new device, or a different device at the old address) goes through the menu,
-# which shows each device's IP address. A TV saved without an ID (tvcast 0.5.5
-# and older) is offered in the menu once, preselected.
+# which shows each device's IP address, and its ID when one address announces
+# several. A TV saved without an ID (tvcast 0.5.5 and older) is offered in the
+# menu once, preselected.
 choose_device() {
   local pick=${1:-} sname="" surl="" sid="" known="" kid="" name url id list choice label
   [[ -s $DEVICE_FILE ]] && IFS=$'\t' read -r sname surl sid <"$DEVICE_FILE"
-  known=$surl kid=$sid
-  [[ -n $known ]] || { known=$(q_get '.device.url // empty'); kid=$(q_get '.device.id // empty'); }
-  [[ $kid =~ $DEV_ID_RE ]] || kid=""
+  known_device
+  known=$KNOWN_URL kid=$KNOWN_ID
   if [[ -z $pick && -n $sname && -n $surl ]] && verify_device "$surl" "$sid"; then
     printf '%s\t%s\t%s\n' "$sname" "$surl" "$sid"
     return
   fi
 
   notify low "Cast to TV" "Looking for TVs on the network…"
-  list=$(discover)
+  list=$(discover "$known" "$kid")
   [[ -n $list ]] || return 1
 
   choice=""
@@ -972,21 +991,28 @@ choose_device() {
   fi
 
   if [[ -z $choice ]]; then
-    local options=() selected=() picked
-    local type
+    local options=() selected=() picked plabel purl type
+    local -A rows=() labels=() nurl=()
+    while IFS=$'\t' read -r _ url _ _; do nurl[$url]=$((${nurl[$url]:-0} + 1)); done <<<"$list"
     while IFS=$'\t' read -r name url type id; do
       if [[ $type == chromecast ]]; then type=Chromecast; else type=DLNA; fi
       label="$(url_host "$url"), $type  $name"
+      # One address, several IDs: the ID tells the rows apart (anyone on the
+      # LAN can announce a record for any address).
+      ((${nurl[$url]} > 1)) && label+="  · ${id:-no ID}"
+      [[ -n ${labels[$label$'\t'$url]:-} ]] && continue
+      labels[$label$'\t'$url]=$name$'\t'$url$'\t'$id
+      rows[$url]=$name$'\t'$url$'\t'$id
       options+=("󰔂"$'\t'"$label"$'\t'"$url")
       [[ -n $kid && $url == "$known" && $id == "$kid" ]] && selected=(--selected "$label"$'\t'"$url")
     done <<<"$list"
     picked=$(omarchy-menu-select "Cast to" "${options[@]}" -- "${selected[@]}") || return 2
-    [[ -n $picked ]] || return 2
-    # The menu returns "label<TAB>url"; map the URL back to the device's name.
-    url=${picked##*$'\t'}
-    while IFS=$'\t' read -r name label _ id; do
-      [[ $label == "$url" ]] && { choice=$name$'\t'$label$'\t'$id; break; }
-    done <<<"$list"
+    [[ -n $picked && $picked == *$'\t'* ]] || return 2
+    # The menu returns "label<TAB>url"; map it back to the row, by label and
+    # URL when one address has several rows.
+    plabel=${picked%$'\t'*} purl=${picked##*$'\t'}
+    choice=${labels[$plabel$'\t'$purl]:-}
+    [[ -n $choice || ${nurl[$purl]:-0} != 1 ]] || choice=${rows[$purl]}
     [[ -n $choice ]] || return 2
   fi
   if [[ ${choice##*$'\t'} =~ $DEV_ID_RE ]]; then printf '%s\n' "$choice" >"$DEVICE_FILE"; fi
@@ -1676,6 +1702,8 @@ cmd_add() { # append; starts playing only when nothing was queued
 
 cmd_pick_device() { # search the network and remember the chosen TV
   resolve_device --pick || return 0
+  # "Is a cast running" and the queue edit are one step against cast/next/stop.
+  transition_lock
   if is_active; then
     # The queue's device is what the running cast is controlled through.
     notify low "Cast to TV" "$DEV_NAME is used from the next cast on. What is playing now stays where it is."
