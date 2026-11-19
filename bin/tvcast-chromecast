@@ -13,21 +13,30 @@
 STATE uses the DLNA AVTransport words so tvcast treats both backends alike:
 PLAYING, PAUSED_PLAYBACK, TRANSITIONING, STOPPED or NO_MEDIA_PRESENT.
 
-It joins the Default Media Receiver session go2tv started, as a second sender.
-It never launches an app: when nothing is casting it reports NO_MEDIA_PRESENT
-and refuses commands. Exit codes: 0 ok, 1 device error, 2 usage, 3 pychromecast
-missing. The device is untrusted: only private LAN addresses are accepted, and
-tvcast runs this under a timeout and a memory limit.
+It joins the media session go2tv started, as a second sender, and only that
+one: the receiver app must be one go2tv launches, and the session's content
+must be served from this machine (go2tv serves the file from the address this
+machine reaches the Chromecast with). Another app, or another sender's
+session on the same receiver app, is reported as NO_MEDIA_PRESENT and gets no
+command, volume and mute included. It never launches an app. Exit codes: 0 ok,
+1 device error, 2 usage, 3 pychromecast missing. The device is untrusted: only
+private LAN addresses are accepted, and tvcast runs this under a timeout and a
+memory limit.
 """
 
 import ipaddress
 import os
+import socket
 import sys
 import uuid
+from urllib.parse import urlsplit
 
 # Google's Default Media Receiver, and the receiver app go2tv 2.x launches.
 MEDIA_RECEIVERS = {"CC1AD845", "C2568A1A"}
-MEDIA_NS = "urn:x-cast:com.google.cast.media"
+LAN_NETS = [
+    ipaddress.ip_network(n)
+    for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10")
+]
 STATES = {
     "PLAYING": "PLAYING",
     "PAUSED": "PAUSED_PLAYBACK",
@@ -50,9 +59,30 @@ def lan_ip(text):
         return ip if os.environ.get("TVCAST_ALLOW_LOOPBACK") == "1" else None
     if str(ip) == "169.254.169.254":  # cloud metadata
         return None
-    if ip.is_private or ip.is_link_local:
+    # The same ranges as tvcast's lan_url, nothing wider.
+    if any(ip.version == n.version and ip in n for n in LAN_NETS):
         return ip
     return None
+
+
+def own_address(ip, port):
+    """The address this machine reaches the device from (no packet is sent)."""
+    family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+    with socket.socket(family, socket.SOCK_DGRAM) as s:
+        s.connect((str(ip), port))
+        return ipaddress.ip_address(s.getsockname()[0])
+
+
+def own_session(ms, local):
+    """True only for a media session whose content this machine serves."""
+    content = getattr(ms, "content_id", None)
+    if not isinstance(content, str) or getattr(ms, "media_session_id", None) is None:
+        return False
+    try:
+        parts = urlsplit(content)
+        return parts.scheme in ("http", "https") and ipaddress.ip_address(parts.hostname or "") == local
+    except ValueError:
+        return False
 
 
 def main(argv):
@@ -87,41 +117,41 @@ def main(argv):
         {HostServiceInfo(str(ip), int(port))}, uuid.UUID(int=0), "Chromecast", None,
         str(ip), int(port), "cast", "Google Inc.",
     )
+    local = own_address(ip, int(port))
     cast = pychromecast.Chromecast(cast_info=info, tries=1, retry_wait=0.1, timeout=4)
     try:
         cast.wait(timeout=5)
         status = cast.status
         if status is None:
             fail("no answer from the Chromecast")
-        # Only join go2tv's session. Touching the media controller while
+        # Only go2tv's receiver apps. Touching the media controller while
         # another app runs would make pychromecast launch the media receiver.
-        if status.app_id not in MEDIA_RECEIVERS and MEDIA_NS not in (status.namespaces or []):
+        ours = status.app_id in MEDIA_RECEIVERS
+        if ours:
+            mc = cast.media_controller
+            mc.block_until_active(timeout=4)
+            ms = mc.status
+            ours = own_session(ms, local)
+        if not ours:
             if cmd == "status":
                 print("NO_MEDIA_PRESENT 0 0 - 0")
                 return 0
-            fail("nothing is casting on this Chromecast")
-        mc = cast.media_controller
-        mc.block_until_active(timeout=4)
-        ms = mc.status
+            fail("tvcast's cast is not what is playing on this Chromecast")
         if cmd == "status":
             state = STATES.get(ms.player_state, "NO_MEDIA_PRESENT")
-            if ms.media_session_id is None:
-                state = "NO_MEDIA_PRESENT"
             pos = int(ms.adjusted_current_time or ms.current_time or 0)
             dur = int(ms.duration or 0)
             level = status.volume_level
             vol = "-" if level is None else str(min(max(round(level * 100), 0), 100))
             print(f"{state} {max(pos, 0)} {max(dur, 0)} {vol} {1 if status.volume_muted else 0}")
             return 0
-        # Volume is the receiver's, set only while go2tv's session runs (checked above).
+        # Volume is the receiver's, set only while our own session runs (checked above).
         if cmd == "volume":
             cast.set_volume(int(rest[0]) / 100, timeout=5)
             return 0
         if cmd == "mute":
             cast.set_volume_muted(rest[0] == "on", timeout=5)
             return 0
-        if ms.media_session_id is None:
-            fail("nothing is casting on this Chromecast")
         if cmd == "seek":
             mc.seek(int(rest[0]), timeout=5)
         else:

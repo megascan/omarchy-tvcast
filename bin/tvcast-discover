@@ -2,7 +2,9 @@
 """Find TVs on the LAN without contacting any host (tvcast's discovery).
 
     tvcast-discover ssdp [seconds]    prints "<reply-source-ip><TAB><LOCATION>"
-    tvcast-discover mdns [seconds]    prints "<name><TAB>http://<ip>:<port><TAB>chromecast<TAB><id>"
+    tvcast-discover mdns [seconds] [url]
+                                      prints "<name><TAB>http://<ip>:<port><TAB>chromecast<TAB><id>"
+                                      (with a url: only the records for that address)
 
 Nothing here makes an HTTP request. tvcast validates every address it prints
 (private LAN IP, not this machine, LOCATION on the replying host) and only
@@ -10,12 +12,17 @@ then fetches the surviving device descriptions itself, with its capped curl.
 
 SSDP: an M-SEARCH for media renderers goes to 239.255.255.250:1900 from a
 source port in 3339-3438, the range the README's ufw rule admits replies on.
-Replies are capped in size and count. A reply whose LOCATION host is not the
-address the reply came from is dropped, so a responder can't point us at
-another machine.
+Only "HTTP/1.1 200" answers to our search targets count. A reply whose LOCATION
+host is not the address the reply came from is dropped, so a responder can't
+point us at another machine; so is a LOCATION with a query or fragment (the
+source address of a reply can be forged, and tvcast will GET what survives).
+Caps count usable answers, after the filters and per sender: junk, repeats or
+many LOCATIONs from one host can't use up the room a real TV needs.
 
 mDNS: _googlecast._tcp through avahi-browse (no fetch at all), or python
-zeroconf when avahi is missing. Only IPv4 records, like go2tv.
+zeroconf when avahi is missing. Only IPv4 records on port 8009 at a private
+address, like go2tv routes them; the caps apply after that filter. A record
+that can't be parsed is skipped, never fatal.
 
 The SSDP target can be moved for tests with TVCAST_SSDP_TARGET=<ip>:<port>.
 """
@@ -31,8 +38,14 @@ import sys
 import time
 
 MAX_REPLIES = 64
+MAX_DATAGRAMS = 4096
+MAX_PER_HOST = 2
 MAX_DATAGRAM = 2048
 MAX_LOCATION = 512
+MAX_RECORDS = 128
+MAX_PER_URL = 4
+CAST_PORT = 8009
+LAN_NETS = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")]
 PORTS = range(3339, 3439)
 SEARCH_TARGETS = (
     "urn:schemas-upnp-org:device:MediaRenderer:1",
@@ -71,9 +84,10 @@ def ssdp(seconds):
                 pass
         time.sleep(0.2)
     seen = set()
-    replies = 0
+    per_host = {}
+    usable = datagrams = 0
     deadline = time.monotonic() + seconds
-    while replies < MAX_REPLIES:
+    while usable < MAX_REPLIES and datagrams < MAX_DATAGRAMS:
         left = deadline - time.monotonic()
         if left <= 0:
             break
@@ -81,16 +95,35 @@ def ssdp(seconds):
         if not ready:
             break
         data, (src, _) = sock.recvfrom(MAX_DATAGRAM)
-        replies += 1
-        text = data.decode("latin-1")
-        m = re.search(r"^location:[ \t]*(\S+)[ \t]*\r?$", text, re.I | re.M)
-        if not m or len(m.group(1)) > MAX_LOCATION:
-            continue
-        loc = clean(m.group(1), MAX_LOCATION)
-        if (src, loc) in seen:
+        datagrams += 1
+        loc = ssdp_location(data.decode("latin-1"), src)
+        if not loc or (src, loc) in seen:
             continue
         seen.add((src, loc))
+        if per_host.get(src, 0) >= MAX_PER_HOST:
+            continue
+        per_host[src] = per_host.get(src, 0) + 1
+        usable += 1
         print(f"{src}\t{loc}", flush=True)
+
+
+def ssdp_location(text, src):
+    """The LOCATION of a usable search answer from src, else None."""
+    if not re.match(r"HTTP/1\.[01] 200\b", text):
+        return None
+    st = re.search(r"^st:[ \t]*(\S+)[ \t]*\r?$", text, re.I | re.M)
+    if not st or not re.fullmatch(r"urn:schemas-upnp-org:(device:MediaRenderer|service:AVTransport):\d{1,2}", st.group(1)):
+        return None
+    m = re.search(r"^location:[ \t]*(\S+)[ \t]*\r?$", text, re.I | re.M)
+    if not m or len(m.group(1)) > MAX_LOCATION:
+        return None
+    loc = clean(m.group(1), MAX_LOCATION)
+    if "?" in loc or "#" in loc:
+        return None
+    host = re.match(r"https?://(\d{1,3}(?:\.\d{1,3}){3})(?::\d{1,5})?(?:/|$)", loc, re.I)
+    if not host or host.group(1) != src:
+        return None
+    return loc
 
 
 def device_id(text):
@@ -109,6 +142,24 @@ def ipv4(text):
         return None
 
 
+def cast_url(ip_text, port):
+    """http://<ip>:8009 for a Chromecast at a private IPv4 address, else None."""
+    ip = ipv4(ip_text)
+    if not ip or port != CAST_PORT:
+        return None
+    addr = ipaddress.IPv4Address(ip)
+    if addr.is_loopback:
+        if os.environ.get("TVCAST_ALLOW_LOOPBACK") != "1":
+            return None
+    elif ip == "169.254.169.254" or not any(addr in n for n in LAN_NETS):
+        return None
+    return f"http://{ip}:{CAST_PORT}"
+
+
+def port_number(text):
+    return int(text) if text.isascii() and text.isdigit() and len(text) <= 5 else None
+
+
 def mdns_avahi(seconds, out):
     try:
         res = subprocess.run(
@@ -123,14 +174,17 @@ def mdns_avahi(seconds, out):
         f = line.split(";", 9)
         if len(f) < 10 or f[0] != "=" or f[2] != "IPv4":
             continue
-        ip, port = ipv4(f[7]), f[8]
-        if not ip or not port.isdigit():
+        url = cast_url(f[7], port_number(f[8]))
+        if not url:
             continue
-        txt = unescape_avahi(f[9])
-        m = re.search(r'"fn=([^"]*)"', txt)
-        name = m.group(1) if m and m.group(1) else unescape_avahi(f[3])
-        m = re.search(r'"id=([^"]*)"', txt)
-        out.add((clean(name, 120), f"http://{ip}:{int(port)}", device_id(m.group(1) if m else "")))
+        try:
+            txt = unescape_avahi(f[9])
+            m = re.search(r'"fn=([^"]*)"', txt)
+            name = m.group(1) if m and m.group(1) else unescape_avahi(f[3])
+            m = re.search(r'"id=([^"]*)"', txt)
+            out.add((clean(name, 120), url, device_id(m.group(1) if m else "")))
+        except ValueError:
+            continue
 
 
 def mdns_zeroconf(seconds, out):
@@ -153,27 +207,43 @@ def mdns_zeroconf(seconds, out):
 
     ServiceBrowser(zc, "_googlecast._tcp.local.", Listener())
     time.sleep(seconds)
-    for name in found[:MAX_REPLIES]:
-        info = zc.get_service_info("_googlecast._tcp.local.", name, timeout=1000)
-        if not info:
+    # Resolving is bounded as a whole: names that never resolve must not add a second each.
+    deadline = time.monotonic() + 3
+    for name in found[:MAX_RECORDS]:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        try:
+            info = zc.get_service_info("_googlecast._tcp.local.", name, timeout=int(min(1.0, left) * 1000))
+            if not info:
+                continue
+            props = info.properties or {}
+            fn = props.get(b"fn", b"") or name.split(".")[0].encode()
+            did = device_id((props.get(b"id", b"") or b"").decode("utf-8", "replace"))
+            for addr in info.parsed_addresses()[:4]:
+                url = cast_url(addr, info.port)
+                if url:
+                    out.add((clean(fn.decode("utf-8", "replace"), 120), url, did))
+        except (ValueError, TypeError, AttributeError, OSError):
             continue
-        props = info.properties or {}
-        fn = props.get(b"fn", b"") or name.split(".")[0].encode()
-        did = device_id((props.get(b"id", b"") or b"").decode("utf-8", "replace"))
-        for addr in info.parsed_addresses()[:4]:
-            ip = ipv4(addr)
-            if ip:
-                out.add((clean(fn.decode("utf-8", "replace"), 120), f"http://{ip}:{int(info.port)}", did))
     zc.close()
 
 
-def mdns(seconds):
+def mdns(seconds, only=None):
     out = set()
     if shutil.which("avahi-browse"):
         mdns_avahi(seconds, out)
     else:
         mdns_zeroconf(seconds, out)
-    for name, url, did in sorted(out)[:MAX_REPLIES]:
+    per_url = {}
+    shown = 0
+    for name, url, did in sorted(out, key=lambda r: (r[1], r[2], r[0])):
+        if only and url != only:
+            continue
+        if per_url.get(url, 0) >= MAX_PER_URL or shown >= MAX_RECORDS:
+            continue
+        per_url[url] = per_url.get(url, 0) + 1
+        shown += 1
         print(f"{name or 'TV'}\t{url}\tchromecast\t{did}")
 
 
@@ -181,7 +251,10 @@ def main(argv):
     if len(argv) < 2 or argv[1] not in ("ssdp", "mdns"):
         sys.exit("usage: tvcast-discover ssdp|mdns [seconds]")
     seconds = float(argv[2]) if len(argv) > 2 and re.fullmatch(r"\d{1,2}", argv[2]) else 4.0
-    (ssdp if argv[1] == "ssdp" else mdns)(seconds)
+    if argv[1] == "ssdp":
+        ssdp(seconds)
+    else:
+        mdns(seconds, argv[3] if len(argv) > 3 else None)
     return 0
 
 
