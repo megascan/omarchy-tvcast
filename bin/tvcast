@@ -1259,26 +1259,49 @@ pin_media() {
 }
 
 # ---------- queue ----------
-# queue.json: {"items":[{"file","title","kind","id"}], "index": <0-based current>,
+# queue.json: {"items":[{"file","title","kind","id","key"}], "index": <0-based current>,
+#              "playing": <key of the item the runner shows> | null,
 #              "device": {"name","url","control","type","id"} | null}
 # Every change is made under flock and lands in one rename, so the file is
 # never seen empty or half written and a failed write leaves the old queue.
+# An item's key names it for as long as it is queued: the runner advances
+# past the item it played by its key, and the bar's row actions send it, so
+# an edit that moved the item in between can't make them hit another one.
 
 # q_read prints the queue normalised: items is always an array of objects with
-# a file, index a small non-negative integer, so a hand-edited or hostile file
-# can't smuggle strings into arithmetic. Unreadable JSON reads as an empty queue.
+# a file and a unique key, index a small non-negative integer, so a
+# hand-edited or hostile file can't smuggle strings into arithmetic.
+# Unreadable JSON reads as an empty queue. Items get a random key when they
+# are queued; one without a usable key (a queue from an older version) gets
+# one from its position, which the next q_update saves, and a repeated key is
+# replaced, so every key names one item.
+KEY_RE='^[A-Za-z0-9-]{1,80}$'
 q_read() {
   local q=""
   [[ -s $QUEUE_FILE ]] && q=$(jq -c '
+    def okkey: type == "string" and test("^[A-Za-z0-9-]{1,80}$");
     (if type == "object" then . else {} end)
     | .items = [(if (.items | type) == "array" then .items[] else empty end)
                 | select(type == "object" and (.file | type) == "string")
                 | .title = (.title | if type == "string" then . else "" end)]
+    | .items |= [to_entries[] | .key as $i | .value | .key = (.key | if okkey then . else "p\($i)" end)]
+    | if ([.items[].key] | unique | length) == (.items | length) then .
+      else .items |= ([to_entries[] | {i: .key, v: .value}] | group_by(.v.key)
+        | map(.[0].first = true) | add | sort_by(.i) | map(if .first then .v else .v + {key: "d\(.i)"} end)) end
     | .index = ((.index // 0) | (tonumber? // 0) | floor
                 | if . >= 0 and . < 1000000000 then . else 0 end)
+    | .playing = (.playing | if okkey then . else null end)
     | .device = (if (.device | type) == "object" then .device else null end)' "$QUEUE_FILE" 2>/dev/null)
-  if [[ -n $q ]]; then printf '%s\n' "$q"; else echo '{"items":[],"index":0,"device":null}'; fi
+  if [[ -n $q ]]; then printf '%s\n' "$q"; else echo '{"items":[],"index":0,"playing":null,"device":null}'; fi
 }
+
+# jq: the position of the item on screen. While a cast runs that is the item
+# the runner shows (.playing), which is not always .index: the runner moves
+# .index on before it starts the next item.
+CUR='def cur($act): ((if $act then (.playing as $pl | first(.items | to_entries[] | select(.value.key == $pl) | .key)) else empty end) // .index);'
+# jq: the position of the item with key $k, or null.
+KEYPOS='def keypos($k): (first(.items | to_entries[] | select(.value.key == $k) | .key) // null);'
+q_cur() { uint "$(q_get --argjson act "$1" "$CUR cur(\$act)")"; } # q_cur true|false
 
 q_get() { q_read | jq -r "$@"; } # q_get [jq args] <filter>
 
@@ -1288,19 +1311,22 @@ q_get() { q_read | jq -r "$@"; } # q_get [jq args] <filter>
 # items before the change, read under the same lock. Large values (the items
 # of a cast) are passed with --slurpfile, not as an argument: one argument is
 # limited to 128 KiB.
-Q_BEFORE=0
+# Q_OLD and Q_NEW are the queue before and after (Q_NEW only on success).
+Q_BEFORE=0 Q_OLD="" Q_NEW=""
 q_update() {
   local lock old new tmp rc=1
+  Q_OLD="" Q_NEW=""
   { exec {lock}>"$LOCK_FILE"; } 2>/dev/null || return 1
   if flock -w 30 "$lock"; then
     old=$(q_read)
+    Q_OLD=$old
     Q_BEFORE=$(uint "$(jq '.items | length' <<<"$old")")
     if new=$(jq -c "$@" <<<"$old") && [[ $new == \{*\} ]]; then
       rm -f -- "$QUEUE_FILE".??????
       if tmp=$(mktemp "$QUEUE_FILE.XXXXXX" 2>/dev/null); then
         if (printf '%s\n' "$new" >"$tmp") 2>/dev/null && cmp -s -- "$tmp" <(printf '%s\n' "$new") &&
           mv -f -- "$tmp" "$QUEUE_FILE" 2>/dev/null; then
-          rc=0
+          rc=0 Q_NEW=$new
         else
           rm -f -- "$tmp"
         fi
@@ -1311,6 +1337,7 @@ q_update() {
   return "$rc"
 }
 SAVE_ERR="Could not save the queue (is the disk full?). Nothing was changed."
+SAVE_STOPPED_ERR="Could not save the queue (is the disk full?). The cast was stopped; the queue is as it was."
 
 q_count() { uint "$(q_get '.items | length')"; }
 q_index() { uint "$(q_get '.index')"; }
@@ -1355,7 +1382,7 @@ items_json() {
     title=${f##*/}
     [[ $title == ?*.* ]] && title=${title%.*}
     jq -cn --arg file "$f" --arg title "$(clean_text 200 <<<"$title")" --arg kind "$(media_kind "$f" "$mime")" \
-      --arg id "$id" '{file: $file, title: $title, kind: $kind, id: $id}'
+      --arg id "$id" --arg key "$(printf 'r%08x%08x' "$SRANDOM" "$SRANDOM")" '{file: $file, title: $title, kind: $kind, id: $id, key: $key}'
   done | jq -cs .
 }
 
@@ -1428,11 +1455,27 @@ start_runner() { # call with the transition lock held
     die "Could not start the cast service."
 }
 
+# foreign_runner <unit>: true while the unit runs another copy's "tvcast _run"
+# (a clone next to the installed plugin). It shares the queue and the TV, so
+# neither may be touched under it: its runner reads a Stop as "file finished".
+foreign_runner() {
+  local props
+  systemctl --user -q is-active "$1" 2>/dev/null || return 1
+  props=$(systemctl --user show "$1" -p Transient -p ExecStart 2>/dev/null) || return 1
+  [[ $props == *Transient=yes* && $props == *"/tvcast _run "* ]]
+}
+
 # stop_runner: stop the runner unit if it is ours. Fails when a unit could not
 # be queried or did not stop: the caller must not go on as if the cast ended
 # (a Stop sent to the TV under a live runner reads as "file finished").
+# Exit 2: another copy of tvcast is casting; nothing was stopped.
 stop_runner() {
   local u rc=0 own
+  for u in "$UNIT" "$LEGACY_UNIT"; do
+    own=0
+    owns_unit "$u" || own=$?
+    ((own == 1)) && foreign_runner "$u" && return 2
+  done
   for u in "$UNIT" "$LEGACY_UNIT"; do
     [[ -n $u ]] || continue
     own=0
@@ -1445,29 +1488,45 @@ stop_runner() {
   return "$rc"
 }
 STOP_ERR="Could not stop the cast that is running (is the user service manager reachable?). Nothing was changed."
+FOREIGN_ERR="Another copy of tvcast is casting. Stop it from that copy first; this one left it and the TV alone."
+stop_or_die() { # stop_or_die <message when the runner could not be stopped>
+  local rc=0
+  stop_runner || rc=$?
+  ((rc == 0)) && return 0
+  ((rc == 2)) && die "$FOREIGN_ERR"
+  die "$1"
+}
 
-# play_at <0-based index | +1 | -1> [--pick]: (re)start playback at that queue
-# item. The TV is settled first, then the running cast is stopped: a cancelled
-# picker or a TV that is off leaves the queue and the cast as they were.
+# play_at <0-based index | +1 | -1> [key]: (re)start playback at that queue
+# item (with a key: the item with that key). Next and Prev step from the item
+# on screen (q_cur), not from .index, which the runner moves on early. The TV
+# is settled first, then the running cast is stopped: a cancelled picker or a
+# TV that is off leaves the queue and the cast as they were.
 play_at() {
-  local want=$1 i count
+  local want=$1 key=${2:-} i count act=false step=0
   (($(q_count) > 0)) || { echo "The queue is empty." >&2; return 1; }
-  resolve_device "${2:-}" || return 0
+  if [[ -n $key && $(q_get --arg k "$key" "$KEYPOS keypos(\$k)") == null ]]; then
+    notify low "Cast to TV" "That item is no longer in the queue."
+    return 1
+  fi
+  resolve_device || return 0
   transition_lock
   count=$(q_count)
   ((count > 0)) || { echo "The queue is empty." >&2; return 1; }
+  is_active && act=true
   case $want in
-    +1 | -1) i=$(($(q_index) + want)) ;;
+    +1 | -1) step=$want i=$(($(q_cur "$act") + want)) ;;
     *) i=$(uint "$want") ;;
   esac
   if [[ $want == +1 ]] && ((i >= count)); then
     notify low "Cast to TV" "That was the last item in the queue."
     return 0
   fi
-  ((i < 0)) && i=0
-  ((i >= count)) && i=$((count - 1))
-  stop_runner || die "$STOP_ERR"
-  q_update --argjson i "$i" "${DEV_ARGS[@]}" ".index = ([\$i, (.items | length) - 1] | min | [., 0] | max) | $DEV_SET" || die "$SAVE_ERR"
+  stop_or_die "$STOP_ERR"
+  # The step is taken again from the queue as it is now, under the lock.
+  q_update --argjson i "$i" --argjson step "$step" --argjson act "$act" --arg k "$key" "${DEV_ARGS[@]}" \
+    "$CUR $KEYPOS (.items | length) as \$len | .index = ((if \$step != 0 then cur(\$act) + \$step elif \$k != \"\" then (keypos(\$k) // \$i) else \$i end)
+       | [., \$len - 1] | min | [., 0] | max) | .playing = null | $DEV_SET" || die "$SAVE_STOPPED_ERR"
   start_runner
 }
 
@@ -1543,24 +1602,36 @@ wait_item_end() {
   done
 }
 
+# jq: advance past the item with key $k, wherever edits moved it. When it was
+# removed, .index already names the item that slid into its place.
+ADVANCE="$KEYPOS"' keypos($k) as $p | if $p != null then .index = $p + 1 else . end'
+
 cmd_run() {
   trap 'kill_player; unpin' EXIT
   trap 'exit 0' TERM INT
-  local q count idx item file fid title kind tc args name url last blind="" rc first="" played=0 failed=0
+  local q count idx item file fid key title kind tc args name url last blind="" rc first="" first_key="" played=0 failed=0
   export TVCAST_IN_RUNNER=1
   rm -rf -- "$CACHE_DIR"/play.*
   rm -f -- "$STATE_FILE".?????? "$CAST_MEDIA_FILE"
+  # Saves the item keys (a queue from an older version has none yet), and
+  # nothing is on screen until the first item starts.
+  q_update '.playing = null' || { write_state '{"active":false}'; die "$SAVE_ERR"; }
   while :; do
     q=$(q_read)
     count=$(uint "$(jq '.items | length' <<<"$q")")
     idx=$(uint "$(jq '.index' <<<"$q")")
-    [[ -n $first ]] || first=$idx
+    if [[ -z $first ]]; then
+      first=$idx
+      first_key=$(jq -r --argjson i "$idx" '.items[$i].key // ""' <<<"$q")
+    fi
     if ((idx >= count)); then
       if ((played == 0 && failed > 0)); then
         # Nothing played: that is not a finished queue. Keep it, back at the
-        # item this run started with. (An add may have landed since the read.)
-        q_update --argjson i "$first" 'if .index >= (.items | length) then .index = ([$i, (.items | length) - 1] | min | [., 0] | max) else . end' ||
+        # item this run started with, found by its key (edits may have moved
+        # it). An add that landed since the read is played instead.
+        q_update --argjson i "$first" --arg k "$first_key" "$KEYPOS"' (.items | length) as $len | if .index >= $len then .index = ((keypos($k) // $i) | [., $len - 1] | min | [., 0] | max) else . end' ||
           { write_state '{"active":false}'; die "$SAVE_ERR"; }
+        [[ $(jq '.index < (.items | length)' <<<"$Q_OLD") == true ]] && continue
         write_state '{"active":false}'
         notify critical "Cast to TV" "None of the $failed queued $( ((failed == 1)) && echo item || echo items) could be played. The queue was kept. See $LOG_FILE"
         exit 0
@@ -1580,6 +1651,7 @@ cmd_run() {
     item=$(jq -c --argjson i "$idx" '.items[$i]' <<<"$q")
     file=$(jq -r '.file // empty' <<<"$item")
     fid=$(jq -r '.id // empty' <<<"$item")
+    key=$(jq -r '.key // empty' <<<"$item")
     title=$(jq -r .title <<<"$item")
     url=$(jq -r '.device.url // empty' <<<"$q")
     # The queue file is re-read on every item; never hand go2tv a URL that
@@ -1598,7 +1670,7 @@ cmd_run() {
       failed=$((failed + 1))
       # A long stale queue must not raise one notification per item.
       ((failed <= 3)) && notify normal "Cast to TV" "Skipping $title: $PIN_ERR"
-      q_update --argjson i "$idx" '.index = $i + 1' || { write_state '{"active":false}'; die "$SAVE_ERR"; }
+      q_update --arg k "$key" "$ADVANCE" || { write_state '{"active":false}'; die "$SAVE_ERR"; }
       continue
     fi
     kind=$PLAY_KIND
@@ -1634,12 +1706,14 @@ cmd_run() {
     fi
     last=$((idx + 1 >= count ? 1 : 0))
 
-    write_state "$(jq -cn --arg title "$title" --arg file "$file" --arg kind "$kind" \
+    q_update --arg k "$key" '.playing = $k' || { write_state '{"active":false}'; die "$SAVE_ERR"; }
+    write_state "$(jq -cn --arg title "$title" --arg file "$file" --arg kind "$kind" --arg key "$key" \
       --arg device "$ADEV_URL" --arg name "$name" --arg control "$ADEV_CTL" --arg subs "$PLAY_SUBS_SRC" --arg type "$ADEV_TYPE" \
       --argjson transcode "$tc" --argjson started "$(date +%s)" --argjson index "$idx" --argjson count "$count" \
-      '{active: true, title: $title, file: $file, kind: $kind, device: $device, deviceName: $name,
+      '{active: true, title: $title, file: $file, kind: $kind, key: $key, device: $device, deviceName: $name,
         type: $type, control: $control, subtitles: $subs, transcode: ($transcode == 1), started: $started,
-        index: $index, count: $count}')"
+        index: $index, count: $count}')" ||
+      die "Could not write $STATE_FILE (is the disk full?), so tvcast could not keep track of the cast. Nothing was sent to the TV."
     if ((count > 1)); then
       notify low "Casting $((idx + 1))/$count to $name" "$title"
     else
@@ -1669,14 +1743,7 @@ cmd_run() {
       failed=$((failed + 1))
       ((failed <= 3)) && notify normal "Cast to TV" "Couldn't play $title, skipping. See $LOG_FILE"
     fi
-    # Advance only past the item we played; a concurrent edit may have moved
-    # it. remove and move keep .index on the playing item, so that is tried
-    # before a search by file (the same file may be queued twice).
-    q_update --argjson i "$idx" --arg file "$file" \
-      'if (.items[$i].file // "") == $file then .index = $i + 1
-       elif (.items[.index].file // "") == $file then .index += 1
-       else .index = ([.items | to_entries[] | select(.value.file == $file) | .key][0] // $i) + 1 end' ||
-      { write_state '{"active":false}'; die "$SAVE_ERR"; }
+    q_update --arg k "$key" "$ADVANCE" || { write_state '{"active":false}'; die "$SAVE_ERR"; }
   done
 }
 
@@ -1737,8 +1804,8 @@ cmd_cast() { # replace the queue with these files and play from the first
   # The TV first: a cancelled picker or no TV leaves the running cast and the queue alone.
   resolve_device "$PICK" || exit 0
   transition_lock
-  stop_runner || die "$STOP_ERR"
-  q_update --slurpfile items "$ITEMS_FILE" "${DEV_ARGS[@]}" ".items = \$items[0] | .index = 0 | $DEV_SET" || die "$SAVE_ERR"
+  stop_or_die "$STOP_ERR"
+  q_update --slurpfile items "$ITEMS_FILE" "${DEV_ARGS[@]}" ".items = \$items[0] | .index = 0 | .playing = null | $DEV_SET" || die "$SAVE_STOPPED_ERR"
   start_runner
 }
 
@@ -1758,8 +1825,8 @@ cmd_add() { # append; starts playing only when nothing was queued
     require_go2tv
     resolve_device "$PICK" || exit 0
     transition_lock
-    stop_runner || die "$STOP_ERR"
-    q_update "${DEV_ARGS[@]}" "$DEV_SET" || die "$SAVE_ERR"
+    stop_or_die "Added $ITEMS_N to the queue, but could not start the cast (is the user service manager reachable?)."
+    q_update "${DEV_ARGS[@]}" "$DEV_SET" || die "Added $ITEMS_N to the queue, but could not save which TV to cast to (is the disk full?)."
     start_runner
   else
     notify low "Cast to TV" "Added $ITEMS_N to the queue ($(q_count) total)."
@@ -1780,7 +1847,9 @@ cmd_pick_device() { # search the network and remember the chosen TV
 }
 
 cmd_next() {
-  (($(q_index) + 1 < $(q_count))) || { notify low "Cast to TV" "That was the last item in the queue."; return 0; }
+  local act=false
+  is_active && act=true
+  (($(q_cur "$act") + 1 < $(q_count))) || { notify low "Cast to TV" "That was the last item in the queue."; return 0; }
   play_at +1
 }
 
@@ -1790,57 +1859,74 @@ cmd_prev() { play_at -1; }
 # not octal, and 20 digits would wrap around to another item).
 ITEM_RE='^0*[1-9][0-9]{0,8}$'
 
-cmd_play_index() { # 1-based
-  if ! [[ ${1:-} =~ $ITEM_RE ]]; then echo "usage: tvcast play-index <N>" >&2; return 2; fi
-  play_at $((10#$1 - 1))
+# Row actions from the bar also pass the item's key: the item is then found
+# by its key, wherever an edit since the list was drawn has moved it.
+row_args() { # row_args <N> [key]: checks the arguments of a row action
+  [[ ${1:-} =~ $ITEM_RE ]] && { [[ -z ${2:-} ]] || [[ $2 =~ $KEY_RE ]]; }
+}
+GONE_MSG="That item is no longer in the queue."
+
+cmd_play_index() { # play-index <N> [key] (1-based)
+  if ! row_args "$@"; then echo "usage: tvcast play-index <N> [key]" >&2; return 2; fi
+  play_at $((10#$1 - 1)) "${2:-}"
 }
 
-cmd_remove() { # 1-based
-  if ! [[ ${1:-} =~ $ITEM_RE ]]; then echo "usage: tvcast remove <N>" >&2; return 2; fi
-  local n=$((10#$1 - 1)) i count was_active=0
+# jq: the position remove/move act on: the item with key $k, else item $n.
+ROWPOS="$KEYPOS"' def rowpos: (if $k != "" then keypos($k) elif $n >= 0 and $n < (.items | length) then $n else null end);'
+
+cmd_remove() { # remove <N> [key] (1-based)
+  if ! row_args "$@"; then echo "usage: tvcast remove <N> [key]" >&2; return 2; fi
+  local n=$((10#$1 - 1)) key=${2:-} p count playing was_active=0
   transition_lock
-  count=$(q_count) i=$(q_index)
-  ((n < count)) || { echo "tvcast: no item $((n + 1))" >&2; return 1; }
   is_active && was_active=1
-  if ((n == i && was_active)); then
-    stop_runner || die "$STOP_ERR"
+  # Which item goes, and whether it is the one playing, is decided on the
+  # queue as the locked edit sees it.
+  q_update --argjson n "$n" --arg k "$key" "$ROWPOS"' rowpos as $p
+    | if $p == null then . else (.items |= del(.[$p])) | (if $p < .index then .index -= 1 else . end)
+      | .index = ([.index, (.items | length) - 1] | min | [., 0] | max) end' || die "$SAVE_ERR"
+  p=$(jq --argjson n "$n" --arg k "$key" "$ROWPOS rowpos" <<<"$Q_OLD")
+  if ! [[ $p =~ ^[0-9]{1,9}$ ]]; then
+    notify low "Cast to TV" "$GONE_MSG"
+    return 1
   fi
-  q_update --argjson n "$n" 'if $n < (.items | length) then (.items |= del(.[$n])) | (if $n < .index then .index -= 1 else . end) else . end' ||
-    die "$SAVE_ERR"
-  count=$(q_count)
+  count=$(uint "$(jq '.items | length' <<<"$Q_NEW")")
+  playing=$(jq -r --argjson p "$p" '(.playing != null) and (.items[$p].key == .playing)' <<<"$Q_OLD")
   if ((count == 0)); then
     cmd_clear
-  elif ((n == i && was_active)); then
-    # The next item slid into the current slot; past the end means we're done.
-    if ((i < count)); then start_runner; else q_update '.index = ([(.items | length) - 1, 0] | max)'; fi
-  elif ((i >= count)); then
-    q_update '.index = ([(.items | length) - 1, 0] | max)'
+  elif ((was_active)) && [[ $playing == true ]]; then
+    stop_or_die "Removed it from the queue, but could not stop it playing (is the user service manager reachable?)."
+    # The next item slid into its slot; past the end means the queue is done.
+    if ((p < count)); then start_runner; fi
   fi
+  return 0
 }
 
-cmd_move() { # move <N> up|down (1-based)
-  [[ ${1:-} =~ ^[0-9]{1,9}$ && ${2:-} =~ ^(up|down)$ ]] || { echo "usage: tvcast move <N> up|down" >&2; return 2; }
-  local a=$((10#$1 - 1)) b st
-  if [[ $2 == up ]]; then b=$((a - 1)); else b=$((a + 1)); fi
-  ((a >= 0 && b >= 0)) || return 0
-  # The bounds are checked under the lock: the queue may have shrunk since any earlier read.
-  q_update --argjson a "$a" --argjson b "$b" \
-    'if $a < (.items | length) and $b < (.items | length) then
-       .items[$a] as $x | .items[$a] = .items[$b] | .items[$b] = $x
-       | if .index == $a then .index = $b elif .index == $b then .index = $a else . end
-     else . end' || die "$SAVE_ERR"
-  # Keep the now-playing count/index in step for the bar.
-  if is_active && [[ -s $STATE_FILE ]]; then
-    st=$(jq -c --argjson i "$(q_index)" 'if type == "object" then .index = $i else empty end' "$STATE_FILE" 2>/dev/null)
-    [[ -n $st ]] && write_state "$st"
+cmd_move() { # move <N> up|down [key] (1-based)
+  if ! [[ ${1:-} =~ ^[0-9]{1,9}$ && ${2:-} =~ ^(up|down)$ ]] || ! [[ -z ${3:-} || $3 =~ $KEY_RE ]]; then
+    echo "usage: tvcast move <N> up|down [key]" >&2
+    return 2
+  fi
+  local n=$((10#$1 - 1)) d=1 key=${3:-}
+  [[ $2 == up ]] && d=-1
+  # The bounds are checked under the lock: the queue may have shrunk since any
+  # earlier read. The bar follows the queue file, so state.json is left alone.
+  q_update --argjson n "$n" --argjson d "$d" --arg k "$key" "$ROWPOS"' rowpos as $a
+    | if $a == null then . else ($a + $d) as $b
+      | if $b >= 0 and $b < (.items | length) then
+          .items[$a] as $x | .items[$a] = .items[$b] | .items[$b] = $x
+          | if .index == $a then .index = $b elif .index == $b then .index = $a else . end
+        else . end end' || die "$SAVE_ERR"
+  if [[ -n $key && $(jq --arg k "$key" "$KEYPOS keypos(\$k)" <<<"$Q_OLD") == null ]]; then
+    notify low "Cast to TV" "$GONE_MSG"
+    return 1
   fi
   return 0
 }
 
 cmd_clear() {
   transition_lock
-  stop_runner || die "$STOP_ERR"
-  q_update '.items = [] | .index = 0' || die "$SAVE_ERR"
+  stop_or_die "$STOP_ERR"
+  q_update '.items = [] | .index = 0 | .playing = null' || die "$SAVE_STOPPED_ERR"
   write_state '{"active":false}'
 }
 
@@ -1857,7 +1943,7 @@ cmd_stop() { # stop playback, keep the queue (play resumes at the same item)
   # Stop the service first so its poller can't mistake the TV's STOPPED for
   # the end of the file and advance; its ExecStopPost sends the TV Stop. If
   # the service can't be stopped, the TV is not told to stop either.
-  stop_runner || die "Could not stop the cast service, so the TV was left playing (is the user service manager reachable?)."
+  stop_or_die "Could not stop the cast service, so the TV was left playing (is the user service manager reachable?)."
   if ((was)); then
     state_active && dev_control stop >/dev/null 2>&1
     write_state '{"active":false}'
@@ -1913,22 +1999,24 @@ cmd_seek_to() {
 # list: queue plus now-playing, no network calls. status --json adds the TV's
 # transport state and position while casting, and --volume its volume and mute
 # (always on Chromecast, where they come in the same status line).
+# A read path: it never writes. A state.json left saying "active" by a runner
+# that is gone is only reported as idle; the stop hook and stop still trust it.
 cmd_list() {
   local active=false st="" last=""
   [[ -s $DEVICE_FILE ]] && last=$(cut -f1 "$DEVICE_FILE")
-  if is_active; then active=true; elif [[ $(state_get active) == true ]]; then write_state '{"active":false}'; fi
+  is_active && active=true
   [[ $active == true && -s $STATE_FILE ]] && st=$(jq -c 'if type == "object" then . else empty end' "$STATE_FILE" 2>/dev/null)
   [[ -n $st ]] || st='{}'
-  q_read | jq -c --argjson active "$active" --argjson st "$st" --arg last "$last" '{
+  q_read | jq -c --argjson active "$active" --argjson st "$st" --arg last "$last" "$CUR"' cur($active) as $i | {
     active: $active,
-    index: (.index // 0),
+    index: $i,
     count: (.items | length),
     deviceName: (.device.name // $last),
     deviceType: ($st.type // .device.type // ""),
-    title: ($st.title // (.items[.index // 0].title // "")),
+    title: ($st.title // (.items[$i].title // "")),
     kind: ($st.kind // ""),
     transcode: ($st.transcode // false),
-    items: [.items | to_entries[] | {n: (.key + 1), title: .value.title, kind: .value.kind, file: .value.file}]
+    items: [.items | to_entries[] | {n: (.key + 1), title: .value.title, kind: .value.kind, file: .value.file, key: .value.key}]
   }'
 }
 
