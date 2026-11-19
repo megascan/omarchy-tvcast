@@ -102,9 +102,19 @@
   it. Run `_run` with `TERM=xterm-256color` (the unit sets it; go2tv's Chromecast screen
   needs it). go2tv 2.x launches its own receiver app (`C2568A1A`), not Google's default one.
 
-- **`install.sh` never deletes an existing install.** It stages the copy first, moves the old
-  plugin dir (edits, `.git`) to `$XDG_STATE_HOME/tvcast/plugin-backups/`, then swaps.
-  `uninstall.sh` keeps those backups. (Reported by a marketplace reviewer on 0.3.0.)
+- **`install.sh` never deletes an existing install.** It stages the copy first, swaps it in
+  with `mv --exchange` (no moment without a plugin), then moves the old plugin dir (edits,
+  `.git`) to `$XDG_STATE_HOME/tvcast/plugin-backups/<id>.<date>[.n]` (a fresh slot, never
+  nested). The old dir is only dropped when it is byte-identical to the new copy or to the
+  previous run's copy (`plugin-copy.sum`). The dev-copy section holds `flock` on the plugins
+  dir; under it, a stale `.<id>.new.*` dir with the `.tvcast-stage` marker is a killed copy
+  (removed), one without is a swapped-out old install (moved to backups). Symlinks there are
+  never touched. Paths are physical (`pwd -P`), or a symlinked `~/.config` looks like a dev
+  clone and replaces the git checkout. The copy is the `plugin_files` allowlist (no
+  untracked files, no `__pycache__`): add new plugin files to it. `uninstall.sh` keeps the
+  backups. (Reported by a marketplace reviewer on 0.3.0.)
+- **`uninstall.sh` changes nothing if `tvcast _stop-owned` fails** (a cast still running, or
+  systemd unreachable): deleting the queue under a live runner is worse than stopping early.
 - **A fake HOME/XDG does not sandbox systemd.** `systemctl --user` talks to the real user
   manager through `XDG_RUNTIME_DIR`. `uninstall.sh` and `tvcast stop/clear` will stop the
   user's live cast. Put stub `systemctl`/`systemd-run` first on PATH before running them in tests.
@@ -143,24 +153,37 @@
   Menu `when` checks and `uninstall.sh` go through `tvcast active` / `tvcast _stop-owned`,
   never raw `systemctl` on a unit name.
 - **Installers never take over a name they don't own.** `install.sh` links
-  `~/.local/bin/tvcast` only if it is free or already resolves into this plugin.
-  The menu snippet never calls that link: it runs the bundled
-  `$HOME/.config/omarchy/plugins/megascan.tvcast/bin/tvcast`, because `when` checks run
-  as soon as the menu opens. Temp and backup files are created fresh (`mkstemp`/`mktemp`),
-  never at a fixed path that could already be a symlink.
+  `~/.local/bin/tvcast` only if it is free or already ours (its literal target is this
+  plugin's `bin/tvcast`, which still works once the plugin dir is gone, or it resolves
+  into this plugin), and exits non-zero when it could not. The menu snippet never calls
+  that link: it runs the bundled `"$HOME/.config/omarchy/plugins/megascan.tvcast/bin/tvcast"`
+  (always quoted: `when` and actions run in bash, and HOME may contain spaces), because
+  `when` checks run as soon as the menu opens. Every row has a `when` that runs the
+  bundled CLI, so after `omarchy plugin remove` (which never runs uninstall.sh) all rows
+  hide. Temp and backup files are created fresh (`mkstemp`/`mktemp`), never at a fixed
+  path that could already be a symlink.
   Menu edits go through `menu/menu-edit.py`. Ownership is the exact lines recorded in
   `$XDG_STATE_HOME/tvcast/menu-owned.json`, keyed by the real (symlink-resolved) file
-  they were written to (plus lines byte-identical to the current snippet). Uninstall
-  cleans each recorded file, not whatever `~/.config/.../omarchy-menu.jsonc` points at
-  now, and keeps the entry for any file it could not clean. A user's own `trigger.cast` parent makes install add nothing; a user's own
-  child key is kept and tvcast's skipped. Uninstall removes only recorded lines, and
-  nothing if `--menu` was never run. Omarchy's JSONC parser only strips whole-line `//`
-  comments, so never mark ownership with trailing comments. Entries go into the object
-  Omarchy reads (`items` when it is an object, else the root; see `MenuModel.js`
-  `readMenuJsonc`), and every edit is re-parsed the same way before writing; any
-  mismatch leaves the menu unchanged and exits non-zero. A failed uninstall keeps the
-  ownership record so a rerun can finish. Writes are atomic via
-  `mkstemp` beside the real (symlink-resolved) file.
+  they were written to, plus lines byte-identical to any snippet line tvcast ever shipped
+  (`menu/legacy-lines.txt`; menus from before 0.5.2 have no record). **Before changing
+  any snippet line, append the old line to `legacy-lines.txt`.** Uninstall cleans each
+  recorded file and the file the menu path points at now. A recorded file that is gone
+  (its directory still there) is forgotten; one whose directory is missing keeps its
+  entry. tvcast entries that remain afterwards (edited, or a user's own child) are named.
+  A user's own `trigger.cast` parent makes install add nothing; a user's own child key is
+  kept and tvcast's skipped. Uninstall does nothing if `--menu` was never run.
+  Omarchy's JSONC parser only strips whole-line `//` comments, so never mark ownership
+  with trailing comments. `omarchy_items` mirrors `MenuModel.js` `readMenuJsonc`
+  exactly, including JS's `\s` set and line terminators (U+2028/2029, BOM; not U+0085)
+  and UTF-8 decoding with replacement. Entries go right after the opening brace of the
+  object Omarchy reads (`items` when it is an object, else the root), so no user or
+  comment line is ever edited; blank or comment-only files get a new `{}`. Every edit
+  is re-parsed before writing; any mismatch leaves the menu unchanged and exits
+  non-zero. Files are read and written as bytes (CRLF and non-UTF-8 bytes survive).
+  A backup is made only when the file changes, is a byte copy, and is removed if the
+  edit fails. Non-regular and hard-linked menus are refused. A failed uninstall keeps
+  the ownership record so a rerun can finish. Writes are atomic via `mkstemp` beside
+  the real (symlink-resolved) file; the record itself is never written through a symlink.
 - **By design, documented in the README:** go2tv's media server is unauthenticated
   HTTP on the TV-facing address while a file plays. The README's first firewall rule
   is scoped to the TV's IP. go2tv's argv carries only the private play-dir symlink

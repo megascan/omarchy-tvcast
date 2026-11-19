@@ -108,10 +108,11 @@ omarchy plugin add https://github.com/megascan/omarchy-tvcast --enable
 
 `omarchy plugin add` installs the bar widget, and the widget works on its own.
 `install.sh` links the `tvcast` CLI into `~/.local/bin`. If something else already
-uses that name, it leaves it alone and says so. `--menu` also adds the menu
-entries to `~/.config/omarchy/extensions/omarchy-menu.jsonc`, after saving a backup
-next to it. It records the exact lines it adds and later replaces or removes only
-those. If you already have your own `"trigger.cast"` menu it adds nothing, and any
+uses that name, it leaves it alone, says so and exits with an error. `--menu` also
+adds the menu entries to `~/.config/omarchy/extensions/omarchy-menu.jsonc`, after
+saving a backup next to it whenever it changes the file. It records the exact lines
+it adds and later replaces or removes only those, plus the lines earlier versions
+of tvcast added. If you already have your own `"trigger.cast"` menu it adds nothing, and any
 `"trigger.cast…"` entry of yours is kept instead of tvcast's. Leave out `--menu`
 to keep your menu untouched.
 
@@ -193,13 +194,18 @@ that can reach the media port, sees its name.
 omarchy plugin remove megascan.tvcast
 ```
 
+If casting can't be stopped (for example the systemd user manager doesn't answer),
+`uninstall.sh` changes nothing and exits with an error. Entries in the menu that
+tvcast didn't write as they are now, such as ones you edited, are kept and listed.
+
 ## Development
 
-From a clone, `./install.sh` copies the working tree into
+From a clone, `./install.sh` copies the plugin's files (the `plugin_files` list
+in `install.sh`, not untracked files) into
 `~/.config/omarchy/plugins/megascan.tvcast`, because the plugin validator doesn't
-allow symlinks. An existing install is moved to
-`~/.local/state/tvcast/plugin-backups/` first, never deleted. Run it again
-after each change.
+allow symlinks. The new copy is swapped in atomically and the old install is moved
+to `~/.local/state/tvcast/plugin-backups/`. It is only dropped when it is still
+exactly the copy the previous run made. Run it again after each change.
 
 ## License
 
