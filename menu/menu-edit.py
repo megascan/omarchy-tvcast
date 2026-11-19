@@ -245,7 +245,7 @@ def uninstall(owned_path, menu=None):
     extra = known_lines(os.path.join(HERE, "omarchy-menu.snippet.jsonc"))
     live = os.path.realpath(menu) if menu else None
     targets = sorted(record)
-    if live and live not in record and record:
+    if live and live not in record:
         targets.append(live)
     failed = False
     for real in targets:
@@ -254,7 +254,7 @@ def uninstall(owned_path, menu=None):
         try:
             found = menu_file(real)
         except OSError as e:
-            print(f"could not read {real}: {e}; kept the record so a rerun can finish", file=sys.stderr)
+            print(f"could not read {real}: {e}; run this again once it can be read", file=sys.stderr)
             failed = True
             continue
         if found is None:
@@ -271,13 +271,16 @@ def uninstall(owned_path, menu=None):
         text = data.decode("utf-8", "surrogateescape")
         lines = text.split("\n")
         kept = [l for l in lines if norm(l) not in owned]
+        present = sorted({norm(l) for l in lines if norm(l) in owned})
         out = "\n".join(kept)
         after = omarchy_items(out)
-        if len(kept) != len(lines) and omarchy_items(text) is None:
+        if present and not recorded:
+            record[real] = present
+        if present and omarchy_items(text) is None:
             print(f"{real} is not a menu Omarchy can read; left it and the record as they are", file=sys.stderr)
             failed = True
             continue
-        if len(kept) != len(lines):
+        if present:
             if nlink > 1:
                 print(f"{real} is hard-linked ({nlink} links); remove tvcast's entries by hand. Kept the record", file=sys.stderr)
                 failed = True
@@ -298,7 +301,7 @@ def uninstall(owned_path, menu=None):
                 failed = True
                 continue
             print(f"removed tvcast's menu entries from {real} (backup: {bak})")
-        left = cast_keys(after)
+        left = cast_keys(after) if recorded or present else []
         if left:
             print(f"left in {real}: {' '.join(left)} (tvcast did not write them as they are now; "
                   "remove them by hand if they are edited tvcast entries)", file=sys.stderr)

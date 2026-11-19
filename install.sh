@@ -54,7 +54,19 @@ if [[ $(readlink -f "$target") != "$here" ]]; then
   trap '[[ -e $stage/.tvcast-stage ]] && rm -rf "$stage"' EXIT
   : >"$stage/.tvcast-stage"
   files=()
-  for f in "${plugin_files[@]}"; do [[ -e $here/$f ]] && files+=("$f"); done
+  listed=("${plugin_files[@]}")
+  if [[ -e $here/.git ]] || git -C "$here" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    tracked=()
+    mapfile -d '' tracked < <(git -C "$here" -c core.fsmonitor=false ls-files -z -- "${plugin_files[@]}" 2>/dev/null)
+    wait $! || { echo "could not list the tracked files in $here (is git installed?); $target left untouched" >&2; exit 1; }
+    ((${#tracked[@]} == 0)) && [[ -e $here/.git ]] && { echo "no tracked plugin files in $here; $target left untouched" >&2; exit 1; }
+    ((${#tracked[@]} == 0)) || { listed=("${tracked[@]}"); from_git=1; }
+  fi
+  for f in "${listed[@]}"; do
+    [[ -e $here/$f || -L $here/$f ]] || continue
+    [[ ${from_git:-0} == 1 && -d $here/$f && ! -L $here/$f ]] && continue
+    files+=("$f")
+  done
   tar -C "$here" --exclude=__pycache__ --exclude='*.pyc' -cf - -- "${files[@]}" | tar -C "$stage" -xf -
   [[ -s $stage/manifest.json ]] || { echo "copy failed; $target left untouched" >&2; exit 1; }
   new_sum=$(tree_sum "$stage")
@@ -82,23 +94,31 @@ if [[ $(readlink -f "$target") != "$here" ]]; then
     else
       [[ -n $slot ]] || make_slot || { echo "could not create a backup in $backups; $target left untouched" >&2; exit 1; }
       move_to_slot "$target"
+      if ! mv -T "$stage" "$target"; then
+        if mv -T "$slot" "$target"; then
+          echo "could not move the new copy into $target; put the previous install back" >&2
+        else
+          echo "could not move the new copy into $target or put the previous install back; it is in $slot" >&2
+        fi
+        exit 1
+      fi
       echo "moved the previous install to $slot"
-      mv -T "$stage" "$target"
       rm -f "$target/.tvcast-stage"
     fi
     echo "copied plugin $id into $target"
   fi
   trap - EXIT
-  (umask 077 && mkdir -p "$state" && printf '%s\n' "$new_sum" >"$copied")
+  (umask 077 && mkdir -p "$state" && printf '%s\n' "$new_sum" >"$copied") 2>/dev/null ||
+    echo "warning: could not write $copied; the next install that changes the plugin backs up $target first" >&2
 fi
 
 # Never replace someone else's `tvcast`: link only when the name is free or
-# already points into this plugin (the same test uninstall.sh uses).
+# already points at this plugin's installed CLI (the same test uninstall.sh uses).
 link=$HOME/.local/bin/tvcast
 own_link() {
   local to
   to=$(readlink "$link") || return 1
-  [[ $to == "$target/bin/tvcast" || $to == */"$id"/bin/tvcast || $(readlink -f "$link") == "$here/bin/tvcast" ]]
+  [[ $to == "$target/bin/tvcast" ]] || { [[ -e $target/bin/tvcast ]] && [[ $(readlink -f "$link") == "$(readlink -f "$target/bin/tvcast")" ]]; }
 }
 if [[ -e $link || -L $link ]] && ! own_link; then
   echo "left $link alone: it is not tvcast's link (remove or rename it, then run this again)" >&2
