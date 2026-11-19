@@ -22,7 +22,7 @@ tree_sum() {
 
 make_slot() {
   local base n=0
-  { (umask 077 && mkdir -p "$backups") && chmod 700 "$state" "$backups"; } || return 1
+  { (umask 077 && mkdir -p "$backups") && { [[ -L $state ]] || chmod 700 "$state"; } && { [[ -L $backups ]] || chmod 700 "$backups"; }; } || return 1
   base=$backups/$id.$(date +%Y%m%d-%H%M%S)
   slot=$base
   while [[ -e $slot || -L $slot ]]; do n=$((n + 1)); slot=$base.$n; done

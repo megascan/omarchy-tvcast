@@ -61,6 +61,8 @@ VIDEO_EXT="mp4 m4v mkv webm mov avi wmv flv mpg mpeg ts m2ts 3gp ogv"
 AUDIO_EXT="mp3 flac wav m4a aac ogg oga opus wma alac aiff"
 IMAGE_EXT="jpg jpeg png gif bmp webp heic"
 
+MAX_QUEUE=2000
+
 # What an LG webOS DLNA renderer plays without help. Anything else is
 # transcoded by go2tv's ffmpeg path (-tc). Override with TVCAST_TRANSCODE=always|never.
 OK_CONTAINERS=" mp4 m4v mkv mov ts m2ts mpg mpeg avi "
@@ -70,8 +72,12 @@ OK_ACODECS=" aac ac3 eac3 mp3 mp2 pcm_s16le pcm_s24le "
 # Queue, state and go2tv's log name the files being watched: owner-only.
 # chmod also tightens dirs created by older versions with the default umask.
 umask 077
-mkdir -p "$CACHE_DIR" "$STATE_DIR"
-chmod 700 "$CACHE_DIR" "$STATE_DIR" 2>/dev/null
+ensure_dirs() {
+  local d
+  for d in "$CACHE_DIR" "$STATE_DIR"; do
+    mkdir -p "$d" && { [[ -L $d ]] || chmod 700 "$d"; }
+  done
+}
 
 # helper_argv <helper>: sets HELPER to the command that runs it. The bundled
 # helpers run with an isolated interpreter (no PYTHONPATH, no user site); a
@@ -113,12 +119,13 @@ notify() { # notify <urgency> <headline> [body]; TVCAST_QUIET=1 prints instead
 # clean_text <max>: drop control characters (escape sequences, tabs, newlines)
 # from untrusted text on stdin and cap its length.
 # C0 and DEL go byte-wise; C1 controls (U+0080-U+009F, e.g. the 8-bit CSI) too,
-# and invisible or bidi-reordering characters (U+200B-U+200F, U+202A-U+202E,
-# U+2066-U+2069, U+FEFF) that would disguise a name.
+# and invisible or bidi-reordering characters (U+061C, U+200B-U+200F, U+202A-U+202E,
+# U+2060-U+2064, U+2066-U+2069, U+FEFF) that would disguise a name. U+2028/U+2029
+# become spaces.
 clean_text() {
   local s
   s=$(LC_ALL=C tr -d '\000-\037\177' |
-    LC_ALL=C sed 's/\xc2[\x80-\x9f]//g; s/\xe2\x80[\x8b-\x8f\xaa-\xae]//g; s/\xe2\x81[\xa6-\xa9]//g; s/\xef\xbb\xbf//g')
+    LC_ALL=C sed 's/\xc2[\x80-\x9f]//g; s/\xd8\x9c//g; s/\xe2\x80[\x8b-\x8f\xaa-\xae]//g; s/\xe2\x80[\xa8\xa9]/ /g; s/\xe2\x81[\xa0-\xa4\xa6-\xa9]//g; s/\xef\xbb\xbf//g')
   printf '%s\n' "${s:0:$1}"
 }
 
@@ -129,6 +136,11 @@ term_text() { clean_text 500 <<<"$1"; }
 die() {
   notify critical "Cast to TV" "$1"
   exit 1
+}
+
+systemd_quote() {
+  local s=${1//\\/\\\\}
+  printf '"%s"' "${s//\"/\\\"}"
 }
 
 # A unit is ours only if it is transient and its main command is this plugin's
@@ -296,24 +308,37 @@ lan_url() {
 # service_url <device-description-url> <service> <controlURL|SCPDURL> [xml]:
 # absolute URL of one of a service's endpoints, refused unless it is on the
 # same origin as the description URL. Pass the description to skip a fetch.
+resolve_url() {
+  local base=$1 ref=$2 origin path
+  if [[ ${ref,,} =~ ^[a-z][a-z0-9+.-]*: ]]; then printf '%s\n' "$ref"; return; fi
+  [[ $ref != //* && $base =~ ^(https?://[^/?#]+) ]] || return 1
+  origin=${BASH_REMATCH[1]}
+  path=${base#"$origin"}
+  path=${path%%[?#]*}
+  case $ref in
+    /*) printf '%s%s\n' "$origin" "$ref" ;;
+    *) printf '%s%s%s\n' "$origin" "${path%/*}/" "$ref" ;;
+  esac
+}
+
 service_url() {
-  local desc_url=$1 svc=$2 elem=$3 xml=${4:-} ctl base origin url
+  local desc_url=$1 svc=$2 elem=$3 xml=${4:-} ctl base ub candidate origin url
   [[ $svc =~ ^[A-Za-z]+$ && $elem =~ ^(controlURL|SCPDURL)$ ]] || return 1
   lan_url "$desc_url" || return 1
   origin=$(url_origin "$desc_url") || return 1
   [[ -n $xml ]] || xml=$(fetch -fsS -m 4 "$desc_url") || return 1
   ctl=$(xpath_str "//*[local-name()='service'][*[local-name()='serviceType' and contains(., '$svc')]]/*[local-name()='$elem']" <<<"$xml")
+  ctl=${ctl#"${ctl%%[![:space:]]*}"}
+  ctl=${ctl%"${ctl##*[![:space:]]}"}
   [[ -n $ctl ]] || return 1
-  if [[ ${ctl,,} =~ ^[a-z][a-z0-9+.-]*: ]]; then
-    url=$ctl
-  else
-    base=$(xpath_str "//*[local-name()='URLBase']" <<<"$xml")
-    # A URLBase pointing anywhere but the description's origin is ignored.
-    [[ -n $base && $(url_origin "$base") == "$origin" ]] || base=$(sed -E 's#^(https?://[^/]+).*#\1#' <<<"$desc_url")
-    base=${base%/}
-    [[ $ctl == /* ]] || ctl=/$ctl
-    url=$base$ctl
+  base=$desc_url
+  ub=$(xpath_str "//*[local-name()='URLBase']" <<<"$xml")
+  ub=${ub#"${ub%%[![:space:]]*}"}
+  ub=${ub%"${ub##*[![:space:]]}"}
+  if [[ -n $ub ]]; then
+    candidate=$(resolve_url "$desc_url" "$ub") && [[ $(url_origin "$candidate" 2>/dev/null) == "$origin" ]] && base=$candidate
   fi
+  url=$(resolve_url "$base" "$ctl") || return 1
   [[ $(url_origin "$url") == "$origin" ]] || {
     echo "tvcast: refusing control URL outside the TV's own address: $(term_text "$url")" >&2
     return 1
@@ -651,7 +676,7 @@ dlna_seek_once() {
     PAUSED_PLAYBACK)
       soap Play '<Speed>1</Speed>' >/dev/null || { SEEK_ERR="The TV didn't resume, so it can't seek."; return 1; }
       repause=1
-      dlna_wait_state '^PLAYING$' 20 >/dev/null || { SEEK_ERR="The TV is still loading this file. Try again in a moment."; return 1; }
+      dlna_wait_state '^PLAYING$' 20 >/dev/null || { SEEK_ERR="The TV is still loading this file. Try again in a moment."; soap Pause >/dev/null 2>&1; return 1; }
       ;;
     LG_TRANSITIONING) SEEK_ERR="The TV is stuck loading this file. Press Stop, then Play."; return 1 ;;
     *TRANSITIONING) SEEK_ERR="The TV is still loading this file. Try again in a moment."; return 1 ;;
@@ -662,8 +687,8 @@ dlna_seek_once() {
       SEEK_ERR="The TV is stuck loading this file. Press Stop, then Play."
     else
       SEEK_ERR="This TV can't seek in this file."
-      [[ -n $repause ]] && soap Pause >/dev/null 2>&1
     fi
+    [[ -n $repause ]] && soap Pause >/dev/null 2>&1
     return 1
   fi
   if [[ -n $repause ]]; then
@@ -675,8 +700,8 @@ dlna_seek_once() {
 # ---------- volume ----------
 # DLNA volume is RenderingControl (Channel Master) on the same device. Its
 # controlURL and the Volume range from its SCPD are resolved with the same
-# origin pinning as AVTransport and cached in RC_FILE per description URL
-# ("none" is retried after a minute). tvcast always speaks 0-100 and scales
+# origin pinning as AVTransport and cached in RC_FILE per description URL and
+# device ID ("none" is retried after a minute). tvcast always speaks 0-100 and scales
 # to the TV's own maximum.
 
 # rc_info: prints "<control-url> <max>" for the active DLNA device.
@@ -686,7 +711,7 @@ rc_info() {
   desc=$ADEV_URL
   now=$(date +%s)
   if [[ -s $RC_FILE ]]; then
-    cache=$(jq -c --arg d "$desc" 'select(.device == $d)' "$RC_FILE" 2>/dev/null)
+    cache=$(jq -c --arg d "$desc" --arg i "$ADEV_ID" 'select(.device == $d and .id == $i)' "$RC_FILE" 2>/dev/null)
     if [[ -n $cache ]]; then
       ctl=$(jq -r '.control // empty' <<<"$cache")
       max=$(uint "$(jq -r '.max // 0' <<<"$cache")")
@@ -709,8 +734,8 @@ rc_info() {
   else
     ctl=""
   fi
-  jq -cn --arg d "$desc" --arg c "$ctl" --argjson m "$max" --argjson t "$now" \
-    '{device: $d, control: $c, max: $m, checked: $t}' >"$RC_FILE"
+  jq -cn --arg d "$desc" --arg i "$ADEV_ID" --arg c "$ctl" --argjson m "$max" --argjson t "$now" \
+    '{device: $d, id: $i, control: $c, max: $m, checked: $t}' >"$RC_FILE"
   [[ -n $ctl ]] || return 1
   printf '%s\t%s\n' "$ctl" "$max"
 }
@@ -938,9 +963,9 @@ choose_device() {
     local type
     while IFS=$'\t' read -r name url type id; do
       if [[ $type == chromecast ]]; then type=Chromecast; else type=DLNA; fi
-      label="$name  ($(url_host "$url"), $type)"
+      label="$(url_host "$url"), $type  $name"
       options+=("󰔂"$'\t'"$label"$'\t'"$url")
-      [[ $url == "$known" && ( -z $kid || $id == "$kid" ) ]] && selected=(--selected "$label"$'\t'"$url")
+      [[ -n $kid && $url == "$known" && $id == "$kid" ]] && selected=(--selected "$label"$'\t'"$url")
     done <<<"$list"
     picked=$(omarchy-menu-select "Cast to" "${options[@]}" -- "${selected[@]}") || return 2
     [[ -n $picked ]] || return 2
@@ -951,7 +976,7 @@ choose_device() {
     done <<<"$list"
     [[ -n $choice ]] || return 2
   fi
-  printf '%s\n' "$choice" >"$DEVICE_FILE"
+  if [[ ${choice##*$'\t'} =~ $DEV_ID_RE ]]; then printf '%s\n' "$choice" >"$DEVICE_FILE"; fi
   printf '%s\n' "$choice"
 }
 
@@ -1307,7 +1332,7 @@ start_runner() { # call with the transition lock held
     die "A user unit named $UNIT exists that tvcast did not create; tvcast left it alone."
   fi
   systemd-run --user --quiet --collect --unit "$UNIT" --description "tvcast queue player" \
-    "${env[@]}" -p "ExecStopPost=$SELF _cleanup" -- nice -n 5 "$SELF" _run ||
+    "${env[@]}" -p "ExecStopPost=$(systemd_quote "$SELF") _cleanup" -- nice -n 5 "$SELF" _run ||
     die "Could not start the cast service."
 }
 
@@ -1317,6 +1342,7 @@ start_runner() { # call with the transition lock held
 stop_runner() {
   local u rc=0 own
   for u in "$UNIT" "$LEGACY_UNIT"; do
+    [[ -n $u ]] || continue
     own=0
     owns_unit "$u" || own=$?
     ((own == 1)) && continue
@@ -1592,6 +1618,7 @@ checked_items() {
   ITEMS_N=$(uint "$(jq length "$ITEMS_FILE" 2>/dev/null)")
   skipped=$((${#FILES[@]} - ITEMS_N))
   ((ITEMS_N > 0)) || die "Nothing playable was picked. tvcast casts local video, audio and image files only."
+  ((ITEMS_N <= MAX_QUEUE)) || die "A queue holds at most $MAX_QUEUE items. Pick fewer files."
   ((skipped > 0)) && notify normal "Cast to TV" "Skipped $skipped that $( ((skipped == 1)) && echo "is not a local video, audio or image file" || echo "are not local video, audio or image files")."
   return 0
 }
@@ -1615,6 +1642,7 @@ cmd_add() { # append; starts playing only when nothing was queued
   ((${#FILES[@]})) || pick_files "Add to TV queue"
   ((${#FILES[@]})) || exit 0
   checked_items
+  (($(q_count) + ITEMS_N <= MAX_QUEUE)) || die "A queue holds at most $MAX_QUEUE items. Remove some first."
   # One locked step decides between "first items" and "append", so two adds
   # at once can't both take the queue for empty.
   q_update --slurpfile items "$ITEMS_FILE" \
@@ -1805,9 +1833,9 @@ cmd_status() {
       read -r st pos dur < <(cc_status 2>/dev/null) || true
     else
       st=$(transport_state 2>/dev/null)
-      read -r pos dur < <(position_info 2>/dev/null) || true
+      [[ $st == UNKNOWN ]] || read -r pos dur < <(position_info 2>/dev/null) || true
     fi
-    [[ $json == --json ]] && { read -r vol muted < <(dev_volume 2>/dev/null) || vol=-1; }
+    [[ $json == --json && $st != UNKNOWN ]] && { read -r vol muted < <(dev_volume 2>/dev/null) || vol=-1; }
   fi
   if [[ $json == --json ]]; then
     vol=$( [[ $vol =~ ^[0-9]{1,3}$ ]] && uint "$vol" || echo -1)
@@ -1859,6 +1887,11 @@ cmd_mute() {
 }
 
 cmd_notify_status() { notify low "Cast to TV" "$(cmd_status)"; }
+
+case ${1:-cast} in
+  list | status | notify-status | active | has-queue | _stop-owned | help | -h | --help) ;;
+  *) ensure_dirs ;;
+esac
 
 case ${1:-cast} in
   cast) shift; cmd_cast "$@" ;;
