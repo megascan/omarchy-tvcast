@@ -7,7 +7,7 @@ import qs.Ui
 
 // Bar widget and queue manager for tvcast. Idle, it is just a cast icon. It
 // watches tvcast's state files (no timers while idle) and polls
-// `tvcast status --json` every two seconds only while a cast is running.
+// `tvcast status --json` while a cast is running (2 s with the panel open, 10 s closed).
 //   Left click: open the queue panel   Middle click: pause/resume
 //   Right click: stop (while casting)  Scroll: seek 30 seconds
 BarWidget {
@@ -42,11 +42,17 @@ BarWidget {
   readonly property bool shownMuted: muteTarget >= 0 ? muteTarget === 1 : muted
   property int currentIndex: 0
   property var items: []
+  property string itemsKey: ""
+  property int itemOffset: 0
+  property int queueCount: 0
+  property bool refreshPending: false
+  property int seekSteps: 0
+  property real wheelAccum: 0
   property bool popupOpen: false
   readonly property color fg: bar ? bar.foreground : Commons.Color.foreground
   readonly property string fontFam: bar ? bar.fontFamily : Style.font.family
 
-  readonly property int count: items.length
+  readonly property int count: queueCount
   readonly property bool hasQueue: count > 0
   readonly property bool engaged: casting || hasQueue
   readonly property bool paused: transport === "PAUSED_PLAYBACK"
@@ -63,13 +69,21 @@ BarWidget {
 
   Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
 
-  // File names are untrusted: plain, single-line and bounded wherever shown.
+  // File names are untrusted: every sink is Text.PlainText, so they only need
+  // to be single-line, bounded and free of control, bidi and invisible characters.
+  function cut(s, n) {
+    if (s.length <= n) return s
+    var c = s.charCodeAt(n - 1)
+    return s.slice(0, c >= 0xD800 && c <= 0xDBFF ? n - 1 : n)
+  }
   function plain(s) {
-    return String(s || "").replace(/[<>&]/g, function(c) { return c === "<" ? "‹" : (c === ">" ? "›" : "+") }).replace(/[\r\n\t]/g, " ").slice(0, 200)
+    return cut(String(s || "")
+      .replace(/[\t\n\v\f\r\u2028\u2029]/g, " ")
+      .replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g, ""), 200)
   }
   function shortTitle(s) {
     var t = plain(s)
-    return t.length > maxTitleChars ? t.slice(0, maxTitleChars - 1) + "…" : t
+    return t.length > maxTitleChars ? cut(t, maxTitleChars - 1) + "…" : t
   }
   function clock(sec) {
     sec = Math.max(0, sec | 0)
@@ -77,15 +91,26 @@ BarWidget {
     return (h > 0 ? h + ":" + (m < 10 ? "0" : "") : "") + m + ":" + (s < 10 ? "0" : "") + s
   }
 
+  readonly property int maxRows: 500
   function applyStatus(text) {
     var d
-    try { d = JSON.parse(text || "{}") } catch (e) { return }
-    if (!d || typeof d !== "object") return
-    var list = Array.isArray(d.items) ? d.items.slice(0, 500) : []
-    root.items = list.map(function(it) { return { title: root.plain(it && it.title), kind: String(it && it.kind || "").slice(0, 10) } })
-    root.currentIndex = Math.max(0, Math.min(Number(d.index) || 0, Math.max(0, list.length - 1)))
+    if (!String(text || "").trim()) return
+    try { d = JSON.parse(text) } catch (e) { return }
+    if (!d || typeof d !== "object" || typeof d.active !== "boolean") return
+    var all = Array.isArray(d.items) ? d.items : []
+    var index = Math.max(0, Math.min(Math.floor(Number(d.index) || 0), Math.max(0, all.length - 1)))
+    var offset = all.length > maxRows ? Math.max(0, Math.min(index - Math.floor(maxRows / 2), all.length - maxRows)) : 0
+    var list = all.slice(offset, offset + maxRows).map(function(it) { return { title: root.plain(it && it.title), kind: String(it && it.kind || "").slice(0, 10) } })
+    var key = offset + "\n" + JSON.stringify(list)
+    if (key !== root.itemsKey) {
+      root.itemOffset = offset
+      root.items = list
+      root.itemsKey = key
+    }
+    root.queueCount = all.length
+    root.currentIndex = index
     root.casting = d.active === true
-    root.title = root.plain(d.title || (list[root.currentIndex] ? list[root.currentIndex].title : ""))
+    root.title = root.plain(d.title || (all[index] ? all[index].title : ""))
     root.deviceName = root.plain(d.deviceName || "").slice(0, 120)
     root.transcoding = d.transcode === true
     root.transport = root.casting ? String(d.transport || "").slice(0, 32) : ""
@@ -111,6 +136,34 @@ BarWidget {
     root.run(["mute", root.muteTarget === 1 ? "on" : "off"])
   }
 
+  // Wheel notches and ±30 s clicks add up; one seek goes out per 150 ms pause,
+  // and never while the previous one is still running.
+  function seekBy(steps) {
+    if (!root.canSeek || steps === 0) return
+    var limit = Math.max(1, Math.ceil(root.duration / 30))
+    root.seekSteps = Math.max(-limit, Math.min(limit, root.seekSteps + steps))
+    root.seekTarget = Math.max(0, Math.min(Math.max(0, root.duration - 1), root.shownPosition + steps * 30))
+    seekHold.restart()
+    seekSend.restart()
+  }
+  function wheelSeek(delta) {
+    if (!delta) return
+    root.wheelAccum += delta
+    var steps = root.wheelAccum > 0 ? Math.floor(root.wheelAccum / 120) : Math.ceil(root.wheelAccum / 120)
+    if (steps === 0 && Math.abs(delta) >= 120) steps = delta > 0 ? 1 : -1
+    if (steps === 0) { wheelReset.restart(); return }
+    root.wheelAccum = 0
+    root.seekBy(steps)
+  }
+  function flushSeek() {
+    if (root.seekSteps === 0 || seekProcess.running) return
+    if (!root.canSeek) { root.seekSteps = 0; return }
+    var secs = root.seekSteps * 30
+    root.seekSteps = 0
+    seekProcess.command = ["bash", "-lc", 'exec "$@"', "bash", root.tvcast, "seek", (secs > 0 ? "+" : "") + secs]
+    seekProcess.running = true
+  }
+
   function seekTo(sec) {
     root.seekTarget = Math.max(0, Math.round(sec))
     seekHold.restart()
@@ -127,7 +180,10 @@ BarWidget {
     return fill(strings.t(key), [title, deviceName, duration > 0 ? clock(position) + " / " + clock(duration) : ""])
   }
 
-  function refresh() { if (!statusProcess.running) statusProcess.running = true }
+  function refresh() {
+    if (statusProcess.running) root.refreshPending = true
+    else statusProcess.running = true
+  }
 
   // Runs the bundled CLI as an argv vector through a login shell (for the
   // session PATH), so nothing is re-tokenized: the arguments are fixed words
@@ -155,11 +211,19 @@ BarWidget {
   Process {
     id: statusProcess
     command: [root.tvcast, "status", "--json"]
-    stdout: StdioCollector { onStreamFinished: root.applyStatus(text) }
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.applyStatus(text) }
+    onExited: if (root.refreshPending) { root.refreshPending = false; Qt.callLater(root.refresh) }
+  }
+
+  Process {
+    id: seekProcess
+    onExited: { refreshSoon.restart(); if (root.seekSteps !== 0) Qt.callLater(root.flushSeek) }
   }
 
   Timer {
-    interval: 2000
+    // Every 2 s while the panel is open; the bar label only needs the
+    // paused state, and title or track changes arrive through the file watches.
+    interval: root.popupOpen ? 2000 : 10000
     repeat: true
     // Paused while the seek knob is held, so a poll can't move it.
     running: root.casting && !root.scrubbing
@@ -170,6 +234,8 @@ BarWidget {
   Timer { id: seekHold; interval: 6000; onTriggered: root.seekTarget = -1 }
 
   Timer { id: refreshSoon; interval: 700; onTriggered: root.refresh() }
+  Timer { id: seekSend; interval: 150; onTriggered: root.flushSeek() }
+  Timer { id: wheelReset; interval: 400; onTriggered: root.wheelAccum = 0 }
   Timer { id: volumeSend; interval: 150; onTriggered: if (root.volumeTarget >= 0) root.run(["volume", root.volumeTarget]) }
   Timer { id: volumeHold; interval: 5000; onTriggered: { root.volumeTarget = -1; root.muteTarget = -1 } }
 
@@ -187,7 +253,7 @@ BarWidget {
       else if (mouseButton === Qt.MiddleButton) { if (root.engaged) root.run(["toggle"]) }
       else { root.popupOpen = !root.popupOpen; if (root.popupOpen) root.refresh() }
     }
-    onWheelMoved: function(delta) { if (root.canSeek) root.run(["seek", delta > 0 ? "+30" : "-30"]) }
+    onWheelMoved: function(delta) { if (root.canSeek) root.wheelSeek(delta) }
   }
 
   // Panel text follows the popup palette, as Omarchy's own popups do.
@@ -359,7 +425,7 @@ BarWidget {
         LayoutMirroring.childrenInherit: true
 
         IconButton { iconText: "󰒮"; tooltipText: strings.t("button.previous"); enabled: root.currentIndex > 0; onClicked: root.run(["prev"]) }
-        IconButton { iconText: "󰶖"; tooltipText: strings.t("button.back30"); enabled: root.canSeek; onClicked: root.run(["seek", "-30"]) }
+        IconButton { iconText: "󰶖"; tooltipText: strings.t("button.back30"); enabled: root.canSeek; onClicked: root.seekBy(-1) }
         IconButton {
           iconText: root.playing ? "󰏤" : "󰐊"
           tooltipText: root.playing ? strings.t("button.pause") : strings.t("button.play")
@@ -367,7 +433,7 @@ BarWidget {
           horizontalPadding: Style.spacing.panelGap
           onClicked: root.run(["toggle"])
         }
-        IconButton { iconText: "󰴆"; tooltipText: strings.t("button.forward30"); enabled: root.canSeek; onClicked: root.run(["seek", "+30"]) }
+        IconButton { iconText: "󰴆"; tooltipText: strings.t("button.forward30"); enabled: root.canSeek; onClicked: root.seekBy(1) }
         IconButton { iconText: "󰒭"; tooltipText: strings.t("button.next"); enabled: root.currentIndex + 1 < root.count; onClicked: root.run(["next"]) }
         IconButton { iconText: "󰓛"; tooltipText: strings.t("button.stop"); enabled: root.casting; onClicked: root.run(["stop"]) }
       }
@@ -447,7 +513,8 @@ BarWidget {
               id: row
               required property var modelData
               required property int index
-              readonly property bool current: index === root.currentIndex
+              readonly property int queuePos: root.itemOffset + index
+              readonly property bool current: queuePos === root.currentIndex
               readonly property bool hot: rowHover.hovered
 
               width: queueColumn.width
@@ -460,7 +527,7 @@ BarWidget {
               MouseArea {
                 anchors.fill: parent
                 cursorShape: Qt.PointingHandCursor
-                onClicked: root.run(["play-index", String(row.index + 1)])
+                onClicked: root.run(["play-index", String(row.queuePos + 1)])
               }
 
               PlainLabel {
@@ -471,7 +538,7 @@ BarWidget {
                 width: root.glyphColumn
                 font.pixelSize: Style.font.bodySmall
                 color: row.current ? Commons.Color.accent : root.pdim
-                text: row.current && root.casting ? root.stateGlyph : String(row.index + 1)
+                text: row.current && root.casting ? root.stateGlyph : String(row.queuePos + 1)
               }
               PlainLabel {
                 anchors.left: rowNumber.right
@@ -492,19 +559,19 @@ BarWidget {
                 IconButton {
                   iconText: "󰁝"; tooltipText: strings.t("button.moveUp"); iconSize: Style.font.bodySmall
                   verticalPadding: 0
-                  enabled: row.index > 0
-                  onClicked: root.run(["move", String(row.index + 1), "up"])
+                  enabled: row.queuePos > 0
+                  onClicked: root.run(["move", String(row.queuePos + 1), "up"])
                 }
                 IconButton {
                   iconText: "󰁅"; tooltipText: strings.t("button.moveDown"); iconSize: Style.font.bodySmall
                   verticalPadding: 0
-                  enabled: row.index + 1 < root.count
-                  onClicked: root.run(["move", String(row.index + 1), "down"])
+                  enabled: row.queuePos + 1 < root.count
+                  onClicked: root.run(["move", String(row.queuePos + 1), "down"])
                 }
                 IconButton {
                   iconText: "󰅖"; tooltipText: strings.t("button.remove"); iconSize: Style.font.bodySmall
                   verticalPadding: 0
-                  onClicked: root.run(["remove", String(row.index + 1)])
+                  onClicked: root.run(["remove", String(row.queuePos + 1)])
                 }
               }
             }
