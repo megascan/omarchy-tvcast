@@ -52,8 +52,14 @@
   Test with `"index":"PATH[$(touch /tmp/x)]"` in queue.json and run next/prev/status/list/move.
 - **Cap everything read from a device.** All requests go through `fetch` (CURL with
   `--max-filesize`, piped through `head -c $MAX_BODY`, since chunked replies declare no size).
-- **Notification text is markup.** `notify` escapes `&`, `<` and `>` in the headline and
-  body, so titles and TV names can't inject links. Don't call `omarchy-notification-send` directly.
+- **Notification text is markup, and escaping it is not enough.** Omarchy's notifier decodes
+  entities three times, rebuilds `<a href>`, turns any `http(s)://` text into a link, and a
+  click on the card opens the first URL in headline or body. The headline is shown as plain
+  text. So `notify` sends the headline unescaped through `note_url` and the body through
+  `note_body`: `<`/`>` become `‹`/`›`, an `&` that could start an entity becomes `＆`, and
+  `://` gets U+2060 after the colon. Don't call `omarchy-notification-send` directly.
+  Check with the host's own `Markup.js`/`Detect.js` (harness `lib/markup-port.js`): no
+  anchor, no card link, no tag, for names holding entity-encoded anchors and URLs.
 - **`script -c` runs its command with `$SHELL`.** Always run it with `SHELL=/bin/bash`.
 - **Test only against fakes in a sandbox.** Export temporary `XDG_CACHE_HOME`, `XDG_STATE_HOME`
   (and `HOME`) in the same shell before running any `tvcast` command, including `_run`.
@@ -233,7 +239,7 @@
 
 - **An address is not an identity.** A saved device carries `id` (DLNA: root device UDN
   via `dlna_udn`; Chromecast: mDNS TXT `id`, re-read with `tvcast-discover mdns`).
-  `verify_device` must pass before reuse in `choose_device`/`ensure_device` and before
+  `verify_device` must pass before reuse in `choose_device`/`resolve_device` and before
   every item in the runner. Auto-select after discovery needs URL **and** ID equal.
   Mismatch or no ID: picker (CLI) or die (runner, after `write_state '{"active":false}'`
   so `_cleanup` doesn't send Stop to the other device). Devices saved by 0.5.5 have no ID
@@ -274,8 +280,78 @@
   paths); counters for background jobs are incremented in the parent, not inside
   `>"$((++i))" &`; an empty friendlyName becomes `TV` before it enters a tab record (IFS
   collapses empty tab fields); `clean_text` also strips U+200B-200F, U+202A-202E,
-  U+2066-2069, U+FEFF; `pick_files` drops any picked name containing a newline; sidecars
+  U+2066-2069, U+FEFF; sidecars
   are only `stem.ext` or `stem.<lang>.ext`; `ext_of` and titles use the basename.
 - **Never `pkill -f`/`pgrep -f` a pattern that appears in your own command line**, and
   never a go2tv pattern at all: the user's live go2tv matches too. Kill test processes
   by the PID you saved.
+
+## Security sweep round 1 (bin/tvcast, tvcast-chromecast, tvcast-discover)
+
+- **The queue's device record is the only source for control.** `adev` loads it
+  (`ADEV_URL/CTL/TYPE/ID`), re-checks `lan_url` and the control URL's origin, and every
+  `soap`, `cc_line`, volume and status call uses it. state.json is display data: never read
+  a URL, type or control endpoint from it. `control_guard` runs `verify_device` before
+  pause/play/stop/seek/volume/mute (a Chromecast pass is cached for 20 s in
+  `$CACHE_DIR/verified`, since each check is an mDNS query).
+  Test: change the fake TV's UDN, or plant another control URL in state.json, then press
+  every control: no request may reach the other endpoint.
+- **A Cast session is ours only if this machine serves its media.** `tvcast-chromecast`
+  requires a go2tv receiver app id, a media session id, and a `content_id` whose host is the
+  local address used to reach the device (`own_address`). The media-namespace fallback is
+  gone: other apps expose that namespace too. Volume and mute are gated the same way.
+  The helper refuses non-LAN addresses itself, not only through `cast_helper`.
+- **Count caps after the filters, and cap per sender.** A flood of junk SSDP replies or mDNS
+  records must not use up the slots a real TV needs. `tvcast-discover` counts only usable
+  replies (HTTP 200, a MediaRenderer/AVTransport ST, LOCATION host == source, no query or
+  fragment) toward 64, two per source address, and reads at most 4096 datagrams. `discover`
+  keeps two LOCATIONs per host, tries the known TV first and fetches with a 2 s connect
+  timeout. Chromecast rows: private IPv4 and port 8009 only; two records for one address
+  with different IDs give an empty ID (the picker opens) unless one is the saved ID.
+  Every per-record parse is inside its own try/except: one bad record never ends the scan.
+- **Bundled Python helpers run as `python3 -I <path>`** (`helper_argv`), so `PYTHONPATH`,
+  `PYTHONSTARTUP` and the user site dir can't inject code. A `TVCAST_*_HELPER` override is
+  run as given (tests).
+- **Lists of paths cross process borders NUL-terminated.** The file chooser is
+  `bin/tvcast-pick` (the portal's URIs, each decoded by itself, `path\0`), not
+  `omarchy-file-select`, whose line output turns `dir\n/b.mp4` into two paths. Exit 1 is
+  "nothing picked", 2 is "could not open" (`pick_files` dies). Names with a line break are
+  still dropped afterwards, because go2tv's log is read by line.
+- **Check the descriptor, not the path.** Anything decided about a file (regular file,
+  real path, identity, MIME) is decided on an open fd: open, then compare
+  `readlink /proc/self/fd/N` with the path that was vetted. `open_regular` opens in a
+  `coproc` child with a 3 s limit and takes the fd over through `/proc/<pid>/fd/3`, so a
+  FIFO or a dead network mount can't hang the runner; `file` and `ffprobe` run under
+  `timeout`. A subtitle sidecar must not resolve to the media file itself and is copied
+  from its fd into a fresh `mktemp -d` under the play dir.
+  Test: swap the path for a FIFO or a symlink between check and open, in a loop.
+- **queue.json and state.json are replaced, never rewritten in place.** `q_update` and
+  `write_state` write a temp file beside the target and `mv` it. (Quickshell's `FileView`
+  watches the directory too, so the bar follows the rename.) `q_update` runs in the
+  caller's shell under `queue.lock`, sets `Q_BEFORE` (items before the edit) and returns
+  non-zero when the save failed; every caller must stop on that (`die "$SAVE_ERR"`), never
+  loop. `q_read` normalises items (objects with string `file` and `title`). Index bounds
+  for `remove`/`move` are checked inside the locked jq filter, not before it.
+  Decide "start the runner?" from `Q_BEFORE` of the same locked edit (`cmd_add`).
+- **A missing state.json means idle; a blank or unreadable one means active**
+  (`state_active`). `_cleanup`, `stop` and the controls must still reach the TV when the
+  file was cut off.
+- **Find the device before stopping anything.** `cast`, `add`, `next`, `prev` and `play`
+  call `resolve_device` (picker, discovery, ID check) first and only then take
+  `transition.lock`, stop the runner, write the queue and start. Esc in the picker or
+  "No TV found" must leave a running cast and its queue untouched. `pick-device` during a
+  cast only saves the choice for the next cast.
+- **A dead go2tv is not the end of the file.** On DLNA `wait_item_end` returns 2 unless the
+  TV itself reports STOPPED/NO_MEDIA_PRESENT; the runner then stops on that item with a
+  notification instead of advancing. When no item of a run could be played, the queue is
+  kept at the item the run began with; "Queue finished" and the clear only happen after at
+  least one item played, and the clear re-checks under the lock that the queue is unchanged.
+  At most three "Skipping" notifications per run.
+- **`stop_runner` reports failure.** `owns_unit` returns 2 when systemd can't be queried;
+  `stop_runner` returns 1 then, and when `systemctl stop` fails. `stop`, `clear` and
+  `_stop-owned` exit non-zero, send no Stop to the TV (a live runner would read it as
+  "file finished") and leave state and queue alone. It only ever names tvcast's own units.
+- **One seek at a time, the latest wins.** `dlna_seek` writes the target to `seek.pending`
+  and returns if another seek holds `seek.lock`; the holder re-reads the target when done.
+  `dlna_wait_state` has a 12 s wall-clock limit, and a failed seek on a TV that was paused
+  is followed by Pause again.

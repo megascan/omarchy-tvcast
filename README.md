@@ -139,6 +139,18 @@ may need its files added again after a remount or reboot. Queue entries saved by
 them again. One side effect: cover art from a `cover.jpg` or `folder.jpg` next to
 an audio file is no longer shown on the TV (art embedded in the file still is).
 
+While something is playing, tvcast finds the TV first and only then stops the
+current file. If you close the TV picker, or no TV answers, the cast and its
+queue stay as they were. Choosing another TV with "Change TV" during a cast
+takes effect from the next cast. Pause, seek, volume and stop go to the TV the
+queue was started on, after the same device ID check; on a Chromecast they work
+only while it plays what this computer is serving, so they never touch another
+app or someone else's cast.
+
+If the TV stops answering in the middle of a file, the queue stops on that file
+and you get a notification; Play starts it again. If none of the queued files
+can be played, the queue is kept.
+
 ## Command line
 
 ```
