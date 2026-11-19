@@ -223,8 +223,8 @@ tvcast didn't write as they are now, such as ones you edited, are kept and liste
 
 ## Development
 
-From a clone, `./install.sh` copies the plugin's files (the `plugin_files` list
-in `install.sh`, not untracked files) into
+From a clone, `./install.sh` copies the files git tracks from the `plugin_files` list
+in `install.sh` into
 `~/.config/omarchy/plugins/megascan.tvcast`, because the plugin validator doesn't
 allow symlinks. The new copy is swapped in atomically and the old install is moved
 to `~/.local/state/tvcast/plugin-backups/`. It is only dropped when it is still
