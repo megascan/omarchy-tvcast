@@ -111,7 +111,7 @@ BarWidget {
     root.currentIndex = index
     root.casting = d.active === true
     root.title = root.plain(d.title || (all[index] ? all[index].title : ""))
-    root.deviceName = root.plain(d.deviceName || "").slice(0, 120)
+    root.deviceName = root.cut(root.plain(d.deviceName || ""), 120)
     root.transcoding = d.transcode === true
     root.transport = root.casting ? String(d.transport || "").slice(0, 32) : ""
     root.position = root.casting ? (Number(d.position) || 0) : 0
@@ -136,8 +136,6 @@ BarWidget {
     root.run(["mute", root.muteTarget === 1 ? "on" : "off"])
   }
 
-  // Wheel notches and ±30 s clicks add up; one seek goes out per 150 ms pause,
-  // and never while the previous one is still running.
   function seekBy(steps) {
     if (!root.canSeek || steps === 0) return
     var limit = Math.max(1, Math.ceil(root.duration / 30))
@@ -165,6 +163,8 @@ BarWidget {
   }
 
   function seekTo(sec) {
+    root.seekSteps = 0
+    seekSend.stop()
     root.seekTarget = Math.max(0, Math.round(sec))
     seekHold.restart()
     root.run(["seek-to", root.seekTarget])
@@ -221,9 +221,8 @@ BarWidget {
   }
 
   Timer {
-    // Every 2 s while the panel is open; the bar label only needs the
-    // paused state, and title or track changes arrive through the file watches.
-    interval: root.popupOpen ? 2000 : 10000
+    // Slower with the panel closed and nothing unsettled: track changes arrive through the file watches.
+    interval: root.popupOpen || !root.canSeek || root.seekTarget >= 0 || root.volumeTarget >= 0 ? 2000 : 10000
     repeat: true
     // Paused while the seek knob is held, so a poll can't move it.
     running: root.casting && !root.scrubbing
