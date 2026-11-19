@@ -157,7 +157,9 @@
 - **Private data on disk is owner-only.** `bin/tvcast` runs with `umask 077`. Before
   any command that writes, it creates and `chmod 700`s its cache and state dirs (older
   installs made them 755). Read-only commands (`list`, `status`, `active`, `has-queue`,
-  `notify-status`) create nothing, and a symlinked dir is never chmod'ed through the link.
+  `notify-status`) create no directories and write no queue or state; `status --volume`
+  may refresh the volume cache (`rendering`, written atomically). A symlinked dir is never
+  chmod'ed through the link.
   The queue, state and `session.log` name what the user watches. `install.sh` makes
   `plugin-backups/` 0700 too. Check with `stat` after a run under `umask 022`.
 - **Untrusted text must never look like an option.** `omarchy-notification-send` parses a
@@ -176,9 +178,9 @@
   Menu `when` checks and `uninstall.sh` go through `tvcast active` / `tvcast _stop-owned`,
   never raw `systemctl` on a unit name.
 - **Installers never take over a name they don't own.** `install.sh` links
-  `~/.local/bin/tvcast` only if it is free or already ours (its literal target is this
-  plugin's `bin/tvcast`, which still works once the plugin dir is gone, or it resolves
-  into this plugin), and exits non-zero when it could not. The menu snippet never calls
+  `~/.local/bin/tvcast` only if it is free or already ours (its literal target is
+  `$plugins/$id/bin/tvcast`, which still works once the plugin dir is gone, or it resolves
+  to the installed CLI), and exits non-zero when it could not. The menu snippet never calls
   that link: it runs the bundled `"$HOME/.config/omarchy/plugins/megascan.tvcast/bin/tvcast"`
   (always quoted: `when` and actions run in bash, and HOME may contain spaces), because
   `when` checks run as soon as the menu opens. Every row has a `when` that runs the
@@ -194,7 +196,7 @@
   (its directory still there) is forgotten; one whose directory is missing keeps its
   entry. tvcast entries that remain afterwards (edited, or a user's own child) are named.
   A user's own `trigger.cast` parent makes install add nothing; a user's own child key is
-  kept and tvcast's skipped. Uninstall does nothing if `--menu` was never run.
+  kept and tvcast's skipped.
   Omarchy's JSONC parser only strips whole-line `//` comments, so never mark ownership
   with trailing comments. `omarchy_items` mirrors `MenuModel.js` `readMenuJsonc`
   exactly, including JS's `\s` set and line terminators (U+2028/2029, BOM; not U+0085)
@@ -265,8 +267,10 @@
   Test: fake TV, switch its UDN mid-queue; the picker must open, the runner must die.
 - **Media allowlist at queue time and in the runner** (`media_ok`): content MIME from
   `file -b --mime-type -` reading stdin (file's sandbox can't open `/proc/<pid>/fd`
-  links) must be video/audio/image, minus `DENY_MIME` (playlists, SVG, ASX), and the
-  extension must not be `.torrent` (go2tv 2.9.0 starts BitTorrent for any `-v *.torrent`,
+  links) must be video/audio/image, minus `DENY_MIME` (playlists, SVG, ASX). Names with a
+  subtitle or playlist extension are refused too (`REFUSED_EXT`: srt vtt ass ssa m3u m3u8 mpd),
+  because go2tv takes subtitles from the name (a `movie.srt` video is burned in as its own
+  subtitles), and the extension must not be `.torrent` (go2tv 2.9.0 starts BitTorrent for any `-v *.torrent`,
   whatever the content). Raw args `-`, `*://*`, `magnet:*` are refused. Test every
   extension the picker offers plus `.torrent`, a real MP4 renamed `.TORRENT`, `.m3u8`,
   `.pls`, `.svg`, a URL and `-`, in `cast`/`add` and as hand-edited queue entries.
@@ -382,6 +386,11 @@
   `dlna_seek_once` has 10 s in total (`seek_left` caps each SOAP call's `-m`); the Pause
   that puts a paused TV back is retried once and reported if it fails. `position_info`
   fails on an unreadable RelTime, so a relative seek is refused rather than sent from 0.
+- **Reads that decide a command wait for the ID check.** `toggle`, `seek` (Chromecast),
+  `volume` and `mute` run `control_guard` before their first read. `status` reads
+  unchecked (display only) and has one 8 s budget (`DEADLINE`, `budget`): each SOAP call
+  and description fetch gets at most what is left. A `rendering` entry is stored only when
+  the description's UDN is the saved ID, and dropped when a volume call fails.
 - **Every queue item has a key** (`r<hex>` from `items_json`; `p<pos>`/`d<pos>` for items
   of older queues, saved at the runner start). `.playing` is the key of the item on screen;
   `cur($act)` (jq) is the current position: that item while active, else `.index`. Row

@@ -51,8 +51,10 @@ RenderingControl, or over the Cast protocol for a Chromecast.
   whatever control URL a device advertises; tvcast refuses them): put the `go2tv` binary on
   your `PATH` or in `~/.local/bin`, or install the AUR package `go2tv`.
 - `ffmpeg`/`ffprobe`, `jq`, `curl`, `libxml2` (`xmllint`), `file`, `iproute2` (`ip`),
-  `python` (discovery and menu edits), `avahi` (`avahi-browse`, for finding
-  Chromecasts) and `util-linux` (`script`, `setsid`, `flock`).
+  `python` (discovery and menu edits), `python-gobject` (`gi`, for the file chooser),
+  `avahi` (`avahi-browse`, for finding Chromecasts) and `util-linux` (`script`, `setsid`, `flock`).
+  The file chooser also needs an xdg-desktop-portal backend that provides FileChooser
+  (`xdg-desktop-portal-gtk` or `folio`); without one, Cast to TV says the chooser could not open.
   Omarchy ships all of these.
 - A **DLNA/UPnP media renderer**, which most smart TVs are (LG webOS, Samsung,
   Sony, Philips and so on), or a **Chromecast** / Google TV (see below).
