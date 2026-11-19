@@ -87,7 +87,7 @@ BarWidget {
   function plain(s) {
     return cut(String(s || "")
       .replace(/[\t\n\v\f\r\u2028\u2029]/g, " ")
-      .replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g, ""), 200)
+      .replace(/[\u0000-\u001f\u007f-\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u2800\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]|\udb40[\udc00-\udfff]|\ud82f[\udca0-\udca3]|\ud834[\udd73-\udd7a]/g, ""), 200)
   }
   function shortTitle(s) {
     var t = plain(s)
@@ -251,7 +251,7 @@ BarWidget {
 
   Timer {
     // Slower with the panel closed and nothing unsettled: track changes arrive through the file watches.
-    interval: root.popupOpen || !root.canSeek || root.seekTarget >= 0 || root.volumeTarget >= 0 ? 2000 : 10000
+    interval: root.popupOpen || root.seekTarget >= 0 || root.volumeTarget >= 0 || /TRANSITIONING/.test(root.transport) ? 2000 : 10000
     repeat: true
     // Paused while the seek knob is held, so a poll can't move it.
     running: root.casting && !root.scrubbing
