@@ -35,6 +35,10 @@ BarWidget {
   // TV volume (0-100). The slider shows volumeTarget/muteTarget until the TV
   // reports them, or volumeHold times out, so it never snaps back.
   property bool volumeControl: false
+  // True once a reply carrying the volume arrived since the panel opened (or
+  // since a poll without one): until then the row is greyed out, so a scroll
+  // can't send a level computed from an old reading.
+  property bool volumeFresh: false
   property int volume: 0
   property bool muted: false
   property int volumeTarget: -1
@@ -50,6 +54,9 @@ BarWidget {
   property int seekSteps: 0
   property real wheelAccum: 0
   property bool popupOpen: false
+  onPopupOpenChanged: if (popupOpen) volumeFresh = false
+  // A slider drag that arrived while a relative seek was still being sent.
+  property int pendingSeekTo: -1
   readonly property color fg: bar ? bar.foreground : Commons.Color.foreground
   readonly property string fontFam: bar ? bar.fontFamily : Style.font.family
 
@@ -58,7 +65,7 @@ BarWidget {
   readonly property bool engaged: casting || hasQueue
   readonly property bool paused: transport === "PAUSED_PLAYBACK"
   // The TV takes seeks only once a file has loaded (LG webOS hangs otherwise).
-  readonly property bool canSeek: casting && duration > 0 && !/TRANSITIONING|STOPPED|NO_MEDIA/.test(transport)
+  readonly property bool canSeek: casting && duration > 0 && !/TRANSITIONING|STOPPED|NO_MEDIA|OTHER/.test(transport)
   readonly property bool playing: casting && !paused
   readonly property string stateGlyph: !casting ? "󰓛" : (paused ? "󰏤" : "󰐊")
   readonly property int maxTitleChars: 26
@@ -101,7 +108,10 @@ BarWidget {
     var all = Array.isArray(d.items) ? d.items : []
     var index = Math.max(0, Math.min(Math.floor(Number(d.index) || 0), Math.max(0, all.length - 1)))
     var offset = all.length > maxRows ? Math.max(0, Math.min(index - Math.floor(maxRows / 2), all.length - maxRows)) : 0
-    var list = all.slice(offset, offset + maxRows).map(function(it) { return { title: root.plain(it && it.title), kind: String(it && it.kind || "").slice(0, 10) } })
+    var list = all.slice(offset, offset + maxRows).map(function(it) {
+      var k = String(it && it.key || "")
+      return { title: root.plain(it && it.title), kind: String(it && it.kind || "").slice(0, 10), key: /^[A-Za-z0-9-]{1,80}$/.test(k) ? k : "" }
+    })
     var key = offset + "\n" + JSON.stringify(list)
     if (key !== root.itemsKey) {
       root.itemOffset = offset
@@ -118,6 +128,7 @@ BarWidget {
     root.position = root.casting ? (Number(d.position) || 0) : 0
     root.duration = root.casting ? (Number(d.duration) || 0) : 0
     if (root.seekTarget >= 0 && (!root.casting || Math.abs(root.position - root.seekTarget) <= 3)) root.seekTarget = -1
+    root.volumeFresh = root.casting && typeof d.volumeControl === "boolean"
     if (!root.casting || typeof d.volumeControl === "boolean") {
       root.volumeControl = root.casting && d.volumeControl === true
       root.volume = root.volumeControl ? Math.max(0, Math.min(100, Number(d.volume) || 0)) : 0
@@ -157,6 +168,11 @@ BarWidget {
     root.seekBy(steps)
   }
   function flushSeek() {
+    if (root.pendingSeekTo >= 0 && !seekProcess.running) {
+      root.run(["seek-to", root.pendingSeekTo])
+      root.pendingSeekTo = -1
+      return
+    }
     if (root.seekSteps === 0 || seekProcess.running) return
     if (!root.canSeek) { root.seekSteps = 0; return }
     var secs = root.seekSteps * 30
@@ -165,12 +181,21 @@ BarWidget {
     seekProcess.running = true
   }
 
+  // A drag waits for a relative seek still on its way, so it lands last.
   function seekTo(sec) {
     root.seekSteps = 0
     seekSend.stop()
-    root.seekTarget = Math.max(0, Math.round(sec))
+    root.seekTarget = Math.max(0, Math.min(Math.max(0, root.duration - 1), 999999999, Math.round(Number(sec) || 0)))
     seekHold.restart()
+    if (seekProcess.running) { root.pendingSeekTo = root.seekTarget; return }
+    root.pendingSeekTo = -1
     root.run(["seek-to", root.seekTarget])
+  }
+  // Row actions name the item by position and by key: the CLI acts on the
+  // item with that key wherever it is now, or on nothing if it is gone.
+  function rowArgs(args, item) {
+    var k = String(item && item.key || "")
+    return /^[A-Za-z0-9-]{1,80}$/.test(k) ? args.concat([k]) : args
   }
 
   // Fill only the placeholders a string has, so translations may drop some.
@@ -221,7 +246,7 @@ BarWidget {
 
   Process {
     id: seekProcess
-    onExited: { refreshSoon.restart(); if (root.seekSteps !== 0) Qt.callLater(root.flushSeek) }
+    onExited: { refreshSoon.restart(); if (root.seekSteps !== 0 || root.pendingSeekTo >= 0) Qt.callLater(root.flushSeek) }
   }
 
   Timer {
@@ -448,8 +473,8 @@ BarWidget {
         width: parent.width
         height: Math.max(muteButton.implicitHeight, volumeSlider.implicitHeight)
         visible: root.casting
-        enabled: root.volumeControl
-        opacity: root.volumeControl ? 1 : 0.4
+        enabled: root.volumeControl && root.volumeFresh
+        opacity: root.volumeControl && root.volumeFresh ? 1 : 0.4
 
         IconButton {
           id: muteButton
@@ -530,7 +555,7 @@ BarWidget {
               MouseArea {
                 anchors.fill: parent
                 cursorShape: Qt.PointingHandCursor
-                onClicked: root.run(["play-index", String(row.queuePos + 1)])
+                onClicked: root.run(root.rowArgs(["play-index", String(row.queuePos + 1)], row.modelData))
               }
 
               PlainLabel {
@@ -563,18 +588,18 @@ BarWidget {
                   iconText: "󰁝"; tooltipText: strings.t("button.moveUp"); iconSize: Style.font.bodySmall
                   verticalPadding: 0
                   enabled: row.queuePos > 0
-                  onClicked: root.run(["move", String(row.queuePos + 1), "up"])
+                  onClicked: root.run(root.rowArgs(["move", String(row.queuePos + 1), "up"], row.modelData))
                 }
                 IconButton {
                   iconText: "󰁅"; tooltipText: strings.t("button.moveDown"); iconSize: Style.font.bodySmall
                   verticalPadding: 0
                   enabled: row.queuePos + 1 < root.count
-                  onClicked: root.run(["move", String(row.queuePos + 1), "down"])
+                  onClicked: root.run(root.rowArgs(["move", String(row.queuePos + 1), "down"], row.modelData))
                 }
                 IconButton {
                   iconText: "󰅖"; tooltipText: strings.t("button.remove"); iconSize: Style.font.bodySmall
                   verticalPadding: 0
-                  onClicked: root.run(["remove", String(row.queuePos + 1)])
+                  onClicked: root.run(root.rowArgs(["remove", String(row.queuePos + 1)], row.modelData))
                 }
               }
             }
