@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Ask the desktop file chooser for media files (tvcast's picker).
+
+    tvcast-pick [--title <title>] [--extensions "<ext ext...>"]
+
+Prints each picked file as an absolute path followed by a NUL byte, so a
+name with a line break can't be read as a second path. Exit codes: 0 picked,
+1 nothing picked, 2 the chooser could not open.
+
+The portal answers with file:// URIs. Each is decoded here by itself;
+anything that is not a local absolute path is dropped.
+"""
+
+import argparse
+import os
+import sys
+from urllib.parse import unquote_to_bytes, urlsplit
+
+ANSWER_TIMEOUT_SEC = 600
+MAX_FILES = 2000
+EXIT_NOTHING_PICKED = 1
+EXIT_CHOOSER_FAILED = 2
+
+
+def uri_to_path(uri):
+    try:
+        parts = urlsplit(uri)
+    except ValueError:
+        return None
+    if parts.scheme != "file" or parts.netloc not in ("", "localhost"):
+        return None
+    path = unquote_to_bytes(parts.path)
+    if not path.startswith(b"/") or b"\0" in path:
+        return None
+    return path
+
+
+def ask(title, extensions):
+    import gi  # noqa: PLC0415 (only the chooser needs it)
+
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib  # noqa: PLC0415
+
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    loop = GLib.MainLoop()
+    uris = []
+
+    def on_response(_connection, _sender, _path, _interface, _signal, params):
+        code, results = params.unpack()
+        if code == 0:
+            uris.extend(results.get("uris", []))
+        loop.quit()
+
+    def subscribe(path):
+        bus.signal_subscribe(
+            "org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request", "Response",
+            path, None, Gio.DBusSignalFlags.NONE, on_response,
+        )
+
+    token = "tvcast%d" % os.getpid()
+    sender = bus.get_unique_name()[1:].replace(".", "_")
+    predicted = "/org/freedesktop/portal/desktop/request/%s/%s" % (sender, token)
+    subscribe(predicted)
+
+    options = {
+        "handle_token": GLib.Variant("s", token),
+        "multiple": GLib.Variant("b", True),
+    }
+    exts = [e.lstrip(".").lower() for e in extensions.split() if e.lstrip(".").isalnum()]
+    if exts:
+        patterns = [(0, "*." + e) for e in exts] + [(0, "*." + e.upper()) for e in exts]
+        label = "Video, audio and images"
+        options["filters"] = GLib.Variant("a(sa(us))", [(label, patterns)])
+        options["current_filter"] = GLib.Variant("(sa(us))", (label, patterns))
+
+    handle = bus.call_sync(
+        "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.FileChooser", "OpenFile",
+        GLib.Variant("(ssa{sv})", ("", title, options)),
+        None, Gio.DBusCallFlags.NONE, -1, None,
+    ).unpack()[0]
+    if handle != predicted:
+        subscribe(handle)
+
+    GLib.timeout_add_seconds(ANSWER_TIMEOUT_SEC, loop.quit)
+    loop.run()
+    return uris
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--title", default="Cast to TV")
+    parser.add_argument("--extensions", default="")
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print("tvcast-pick: unknown option %s" % unknown[0], file=sys.stderr)
+        return EXIT_CHOOSER_FAILED
+    paths = [p for p in map(uri_to_path, ask(args.title, args.extensions)[:MAX_FILES]) if p]
+    out = sys.stdout.buffer
+    for path in paths:
+        out.write(path + b"\0")
+    out.flush()
+    return 0 if paths else EXIT_NOTHING_PICKED
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001 (no bus, no portal, no python-gobject)
+        print("tvcast-pick: %s: %s" % (type(e).__name__, e), file=sys.stderr)
+        sys.exit(EXIT_CHOOSER_FAILED)
