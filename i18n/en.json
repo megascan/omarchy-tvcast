@@ -27,5 +27,10 @@
   "panel.position": "%1 of %2",
   "button.mute": "Mute",
   "button.unmute": "Unmute",
-  "panel.noVolume": "This TV offers no volume control"
+  "panel.noVolume": "This TV offers no volume control",
+  "button.audio": "Audio track",
+  "button.subtitles": "Subtitles & captions",
+  "panel.audio": "Audio",
+  "panel.subtitles": "Captions",
+  "panel.subsOff": "Off"
 }

@@ -54,7 +54,14 @@ BarWidget {
   property int seekSteps: 0
   property real wheelAccum: 0
   property bool popupOpen: false
-  onPopupOpenChanged: if (popupOpen) volumeFresh = false
+  onPopupOpenChanged: { if (popupOpen) volumeFresh = false; else trackMenu = "" }
+  // Audio and subtitle tracks of the currently casting video.
+  property var audioTracks: []
+  property int activeAudio: 0
+  property var subtitleTracks: []
+  property string activeSubtitle: "off"
+  property string trackMenu: ""
+  readonly property bool hasTracks: casting && (audioTracks.length > 1 || subtitleTracks.length > 1)
   // A slider drag that arrived while a relative seek was still being sent.
   property int pendingSeekTo: -1
   readonly property color fg: bar ? bar.foreground : Commons.Color.foreground
@@ -136,6 +143,43 @@ BarWidget {
       if (root.volumeTarget >= 0 && !volumeSend.running && (!root.volumeControl || Math.abs(root.volume - root.volumeTarget) <= 1)) root.volumeTarget = -1
       if (root.muteTarget >= 0 && (!root.volumeControl || (root.muteTarget === 1) === root.muted)) root.muteTarget = -1
     }
+    if (root.casting) {
+      var aRaw = Array.isArray(d.audioTracks) ? d.audioTracks.slice(0, 32) : []
+      root.audioTracks = aRaw.map(function(t) {
+        return { index: Math.max(1, Math.min(999, Math.floor(Number(t && t.index) || 0))), label: root.cut(root.plain(t && t.label), 60) }
+      }).filter(function(t) { return t.index > 0 && t.label !== "" })
+      root.activeAudio = Math.max(0, Math.floor(Number(d.audio) || 0))
+      var sRaw = Array.isArray(d.subtitleTracks) ? d.subtitleTracks.slice(0, 48) : []
+      root.subtitleTracks = sRaw.map(function(t) {
+        var id = String(t && t.id || "")
+        return { id: /^(off|sidecar:[0-9]{1,3}|emb:[0-9]{1,3})$/.test(id) ? id : "", label: root.cut(root.plain(t && t.label), 60) }
+      }).filter(function(t) { return t.id !== "" && t.label !== "" })
+      var subId = String(d.subtitle || "off")
+      root.activeSubtitle = /^(off|sidecar:[0-9]{1,3}|emb:[0-9]{1,3})$/.test(subId) ? subId : "off"
+    } else {
+      root.audioTracks = []
+      root.activeAudio = 0
+      root.subtitleTracks = []
+      root.activeSubtitle = "off"
+      root.trackMenu = ""
+    }
+  }
+
+  function currentItemObj() {
+    var rel = root.currentIndex - root.itemOffset
+    return (rel >= 0 && rel < root.items.length) ? root.items[rel] : null
+  }
+  function activeAudioLabel() {
+    for (var i = 0; i < root.audioTracks.length; i++) {
+      if (root.audioTracks[i].index === root.activeAudio) return root.audioTracks[i].label
+    }
+    return root.audioTracks.length > 0 ? root.audioTracks[0].label : strings.t("panel.audio")
+  }
+  function activeSubtitleLabel() {
+    for (var i = 0; i < root.subtitleTracks.length; i++) {
+      if (root.subtitleTracks[i].id === root.activeSubtitle) return root.subtitleTracks[i].label
+    }
+    return strings.t("panel.subsOff")
   }
 
   // One SetVolume per pause in dragging or scrolling (150 ms), not per step.
@@ -514,6 +558,107 @@ BarWidget {
           elide: Text.ElideNone
           font.pixelSize: Style.font.caption
           text: root.volumeControl ? String(root.shownVolume) : "–"
+        }
+      }
+
+      // Audio language & captions/subtitles switcher (shown only when the
+      // current video has multiple audio tracks or any captions).
+      Item {
+        id: tracksRow
+        width: parent.width
+        height: Math.max(audioToggle.visible ? audioToggle.implicitHeight : 0, subToggle.visible ? subToggle.implicitHeight : 0)
+        visible: root.hasTracks
+
+        IconButton {
+          id: audioToggle
+          visible: root.audioTracks.length > 1
+          anchors.left: parent.left
+          anchors.verticalCenter: parent.verticalCenter
+          width: subToggle.visible ? Math.floor((parent.width - Style.space(6)) / 2) : parent.width
+          iconText: "󰗊"
+          text: root.cut(root.activeAudioLabel(), 18)
+          fontSize: Style.font.bodySmall
+          iconSize: Style.font.body
+          tooltipText: strings.t("button.audio")
+          onClicked: root.trackMenu = root.trackMenu === "audio" ? "" : "audio"
+        }
+        IconButton {
+          id: subToggle
+          visible: root.subtitleTracks.length > 1
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          width: audioToggle.visible ? Math.floor((parent.width - Style.space(6)) / 2) : parent.width
+          iconText: root.activeSubtitle === "off" ? "󰨗" : "󰨖"
+          text: root.cut(root.activeSubtitleLabel(), 18)
+          fontSize: Style.font.bodySmall
+          iconSize: Style.font.body
+          tooltipText: strings.t("button.subtitles")
+          onClicked: root.trackMenu = root.trackMenu === "subtitle" ? "" : "subtitle"
+        }
+      }
+
+      // Inline track list when Audio or Captions is expanded.
+      Flickable {
+        id: trackListView
+        width: parent.width
+        height: Math.min(trackListCol.implicitHeight, Style.spacing.popupRowHeight * 6)
+        contentHeight: trackListCol.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        visible: root.hasTracks && root.trackMenu !== ""
+
+        Column {
+          id: trackListCol
+          width: trackListView.width
+          spacing: Style.space(2)
+
+          Repeater {
+            model: root.trackMenu === "audio" ? root.audioTracks : (root.trackMenu === "subtitle" ? root.subtitleTracks : [])
+
+            Rectangle {
+              id: trackRow
+              required property var modelData
+              readonly property bool isAudio: root.trackMenu === "audio"
+              readonly property bool selected: isAudio ? (modelData.index === root.activeAudio) : (modelData.id === root.activeSubtitle)
+
+              width: trackListCol.width
+              height: Style.spacing.popupRowHeight
+              radius: Style.cornerRadius
+              color: selected ? Style.selectedFillFor(root.pfg, Commons.Color.accent)
+                : (trackHover.hovered ? Style.hoverFill : "transparent")
+
+              HoverHandler { id: trackHover }
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  var cmd = trackRow.isAudio ? ["audio", String(trackRow.modelData.index)] : ["subtitle", String(trackRow.modelData.id)]
+                  root.trackMenu = ""
+                  root.run(root.rowArgs(cmd, root.currentItemObj()))
+                }
+              }
+
+              PlainLabel {
+                id: trackCheck
+                anchors.left: parent.left
+                anchors.leftMargin: Style.spacing.controlPaddingX
+                anchors.verticalCenter: parent.verticalCenter
+                width: root.glyphColumn
+                font.pixelSize: Style.font.bodySmall
+                color: trackRow.selected ? Commons.Color.accent : root.pdim
+                text: trackRow.selected ? "󰄬" : ""
+              }
+              PlainLabel {
+                anchors.left: trackCheck.right
+                anchors.right: parent.right
+                anchors.rightMargin: Style.spacing.controlPaddingX
+                anchors.verticalCenter: parent.verticalCenter
+                font.pixelSize: Style.font.bodySmall
+                font.bold: trackRow.selected
+                text: trackRow.modelData.label
+              }
+            }
+          }
         }
       }
 

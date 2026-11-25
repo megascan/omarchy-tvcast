@@ -24,10 +24,17 @@ RenderingControl, or over the Cast protocol for a Chromecast.
 - **DLNA and Chromecast:** the TV picker lists both, with each device's IP address
   and type. A device you haven't picked before is never chosen for you. When one
   address announces several device IDs, each gets its own row ending in the ID.
-- **Format check (DLNA):** ffprobe decides whether a video needs transcoding. H.264, HEVC,
-  MPEG-2 and MPEG-4 video in MP4, MKV, MOV, TS or AVI with AAC, AC3, EAC3 or MP3
-  audio plays as-is. Everything else gets go2tv's ffmpeg transcode (`-tc`).
-  On a Chromecast, go2tv makes that call itself.
+- **Format check:** ffprobe decides whether a video needs transcoding. On a DLNA TV,
+  H.264, HEVC, MPEG-2 and MPEG-4 video in MP4, MKV, MOV, TS or AVI with AAC, AC3,
+  EAC3 or MP3 audio plays as-is. Everything else gets go2tv's ffmpeg transcode (`-tc`).
+  On a Chromecast, go2tv checks the video itself, and tvcast transcodes any audio
+  that isn't AAC, MP3, Opus, Vorbis or FLAC (Google TVs play AC3 and DTS as silence).
+  go2tv encodes on the GPU (NVENC, VA-API or Quick Sync) when ffmpeg has a working
+  hardware encoder, and falls back to libx264.
+- **Audio and subtitle tracks:** when a video has more than one audio track or any
+  text subtitles (embedded or sidecar), the bar popup shows Audio and Captions
+  buttons under the volume slider. Switching restarts the stream and seeks back
+  to where it was. Picture-based subtitles (PGS, VobSub) aren't offered.
 - **Subtitles:** a sidecar with the same name (`movie.srt`, `movie.en.srt`, `.vtt`,
   `.ass`, `.ssa`) is sent along automatically. A sidecar is ignored if it links to
   a file in another folder, if anyone but you can change it, or if it isn't plain
@@ -171,6 +178,7 @@ tvcast next | prev | play-index N | remove N | move N up|down | clear | list
 tvcast play | toggle | pause | resume | stop
 tvcast seek +30 | seek -30 | seek 1:02:03 | seek-to <seconds>
 tvcast volume [N|+N|-N|up|down] | mute [on|off|toggle]
+tvcast tracks | audio N | subtitle off|sidecar:N|emb:N
 tvcast status [--json [--volume]] | devices [--json] | pick-device
 ```
 

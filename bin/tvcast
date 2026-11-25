@@ -19,6 +19,9 @@
 #   tvcast stop                      stop playback, keep the queue
 #   tvcast volume [N|+N|-N|up|down]  TV volume 0-100 (no argument: print it)
 #   tvcast mute [on|off|toggle]      mute the TV (default: toggle)
+#   tvcast tracks                    list audio and subtitle tracks of current item
+#   tvcast audio <N> [key]           switch audio track (1-based; restarts at position)
+#   tvcast subtitle <id> [key]       switch captions (off|sidecar:N|emb:N)
 #   tvcast status [--json [--volume]] now playing (+ TV state, position, volume)
 #   tvcast devices [--json]          discover TVs and Chromecasts (a few seconds)
 #   tvcast pick-device               discover and choose the TV to cast to
@@ -68,6 +71,9 @@ MAX_QUEUE=2000
 OK_CONTAINERS=" mp4 m4v mkv mov ts m2ts mpg mpeg avi "
 OK_VCODECS=" h264 hevc mpeg2video mpeg4 "
 OK_ACODECS=" aac ac3 eac3 mp3 mp2 pcm_s16le pcm_s24le "
+# Chromecast's default receiver decodes these; AC3/EAC3/DTS play as silence on
+# a Google TV's own speakers, so those go through go2tv's -tc path.
+CC_ACODECS=" aac mp3 opus vorbis flac "
 
 # Queue, state and go2tv's log name the files being watched: owner-only.
 # chmod also tightens dirs created by older versions with the default umask.
@@ -1224,12 +1230,12 @@ choose_device() {
   fi
 
   if [[ -z $choice ]]; then
-    local options=() selected=() picked plabel purl type
+    local options=() selected=() picked plabel purl type width=0
     local -A rows=() labels=() nurl=()
     while IFS=$'\t' read -r _ url _ _; do nurl[$url]=$((${nurl[$url]:-0} + 1)); done <<<"$list"
     while IFS=$'\t' read -r name url type id; do
       if [[ $type == chromecast ]]; then type=Chromecast; else type=DLNA; fi
-      label="$(url_host "$url"), $type  $name"
+      label="$(url_host "$url") · $type · $name"
       # One address, several IDs: the ID tells the rows apart (anyone on the
       # LAN can announce a record for any address).
       ((${nurl[$url]} > 1)) && label+="  · ${id:-no ID}"
@@ -1237,9 +1243,13 @@ choose_device() {
       labels[$label$'\t'$url]=$name$'\t'$url$'\t'$id
       rows[$url]=$name$'\t'$url$'\t'$id
       options+=("󰔂"$'\t'"$label"$'\t'"$url")
+      ((${#label} > width)) && width=${#label}
       [[ -n $kid && $url == "$known" && $id == "$kid" ]] && selected=(--selected "$label"$'\t'"$url")
     done <<<"$list"
-    picked=$(omarchy-menu-select "Cast to" "${options[@]}" -- "${selected[@]}") || return 2
+    width=$((width * 10 + 120))
+    ((width < 420)) && width=420
+    ((width > 1100)) && width=1100
+    picked=$(omarchy-menu-select "Cast to" "${options[@]}" -- --width "$width" "${selected[@]}") || return 2
     [[ -n $picked && $picked == *$'\t'* ]] || return 2
     # The menu returns "label<TAB>url"; map it back to the row, by label and
     # URL when one address has several rows.
@@ -1362,8 +1372,8 @@ media_seconds() {
 }
 
 # needs_transcode <video>: exit 0 when the TV likely can't play the video as is.
-needs_transcode() {
-  local f=$1 e streams vcodec acodecs a formats
+needs_transcode() { # needs_transcode <video> [audio-only]
+  local f=$1 audio_only=${2:-} e streams vcodec acodecs a formats ok_a=$OK_ACODECS
   case ${TVCAST_TRANSCODE:-auto} in
     always) return 0 ;;
     never) return 1 ;;
@@ -1372,29 +1382,42 @@ needs_transcode() {
   [[ $OK_CONTAINERS == *" $e "* ]] || return 0
   formats=$(sed -n 's/^FORMATS=//p' "${SELF%/*}/tvcast-ffwrap" 2>/dev/null)
   streams=$(timeout 6 ffprobe -v error -protocol_whitelist file -format_whitelist "${formats:-mov,matroska,mpegts,avi,mpeg}" -show_entries stream=codec_type,codec_name -of csv=p=0 -- "$f" 2>/dev/null) || return 0
-  vcodec=$(awk -F, '$2 == "video" {print $1; exit}' <<<"$streams")
-  [[ -n $vcodec && $OK_VCODECS == *" $vcodec "* ]] || return 0
+  if [[ -n $audio_only ]]; then
+    ok_a=$CC_ACODECS
+  else
+    vcodec=$(awk -F, '$2 == "video" {print $1; exit}' <<<"$streams")
+    [[ -n $vcodec && $OK_VCODECS == *" $vcodec "* ]] || return 0
+  fi
   acodecs=$(awk -F, '$2 == "audio" {print $1}' <<<"$streams")
   # Only the default (first) audio track is played.
   a=$(head -n1 <<<"$acodecs")
-  [[ -z $a || $OK_ACODECS == *" $a "* ]] || return 0
+  [[ -z $a || $ok_a == *" $a "* ]] || return 0
   return 1
 }
 
-# subtitle_for <file>: a sidecar with the same name, movie.srt or movie.<lang>.srt
-# (lang: 2-8 letters or dashes, e.g. en, pt-BR).
-subtitle_for() {
-  local f=$1 stem ext cand lang
+# subtitles_for <file>: all valid sidecars with the same name, movie.srt or
+# movie.<lang>.srt (lang: 2-8 letters or dashes, e.g. en, pt-BR), unique by real path.
+subtitles_for() {
+  local f=$1 stem ext cand lang real seen=$'\n' n=0
   stem=${f%.*}
   for ext in srt vtt ass ssa; do
     for cand in "$stem.$ext" "$stem".*."$ext"; do
       lang=${cand#"$stem".}
       lang=${lang%."$ext"}
       [[ $cand == "$stem.$ext" || $lang =~ ^[A-Za-z-]{2,8}$ ]] || continue
-      [[ -f $cand ]] && { printf '%s\n' "$cand"; return; }
+      [[ -f $cand ]] || continue
+      real=$(readlink -f -- "$cand" 2>/dev/null) || continue
+      [[ ${real%/*} == "${f%/*}" ]] || continue
+      [[ $seen == *$'\n'"$real"$'\n'* ]] && continue
+      seen+="$real"$'\n'
+      printf '%s\n' "$cand"
+      n=$((n + 1))
+      ((n >= 24)) && return 0
     done
   done
 }
+
+subtitle_for() { subtitles_for "$1" | head -n1; }
 
 subs_ok() {
   local mime first
@@ -1422,18 +1445,203 @@ subs_ok() {
 # Sidecar cover art (cover.jpg) is not shown: go2tv only reads it from the
 # media file's own directory.
 MEDIA_FD="" PLAY_DIR="" PLAY_FILE="" PLAY_SUBS="" PLAY_SUBS_SRC="" PLAY_KIND="" PIN_ERR=""
+PLAY_AUDIO_TRACKS='[]' PLAY_AUDIO_DEFAULT=0 PLAY_AUDIO_COUNT=0
+PLAY_SUB_TRACKS='[]' PLAY_ACTIVE_SUB='off'
+PLAY_SUB_PATHS=() PLAY_SUB_EMB_CODEC=()
 MAX_SUBS=8388608
 
 unpin() {
   [[ -n $MEDIA_FD ]] && exec {MEDIA_FD}<&-
   [[ -n $PLAY_DIR ]] && rm -rf -- "$PLAY_DIR"
   MEDIA_FD="" PLAY_DIR="" PLAY_FILE="" PLAY_SUBS="" PLAY_SUBS_SRC="" PLAY_KIND=""
+  PLAY_AUDIO_TRACKS='[]' PLAY_AUDIO_DEFAULT=0 PLAY_AUDIO_COUNT=0
+  PLAY_SUB_TRACKS='[]' PLAY_ACTIVE_SUB='off'
+  PLAY_SUB_PATHS=() PLAY_SUB_EMB_CODEC=()
 }
 
-# pin_media <file> <file-id>: on success sets PLAY_FILE (and PLAY_SUBS for a
-# video with a sidecar) and PLAY_KIND; on failure PIN_ERR says why.
+# probe_tracks <pinned-media-file> <orig-file>: populate PLAY_AUDIO_TRACKS,
+# PLAY_AUDIO_DEFAULT, PLAY_AUDIO_COUNT, PLAY_SUB_TRACKS, PLAY_SUB_PATHS and
+# PLAY_SUB_EMB_CODEC from ffprobe (on the pinned fd) and same-dir sidecars.
+probe_tracks() {
+  local pfile=$1 orig=$2 formats probe sidecars=() s stem ext lang lbl idx sidx codec sc_json emb_json
+  PLAY_AUDIO_TRACKS='[]' PLAY_AUDIO_DEFAULT=0 PLAY_AUDIO_COUNT=0
+  PLAY_SUB_TRACKS='[]' PLAY_SUB_PATHS=() PLAY_SUB_EMB_CODEC=()
+  formats=$(sed -n 's/^FORMATS=//p' "${SELF%/*}/tvcast-ffwrap" 2>/dev/null)
+  probe=$(timeout 6 ffprobe -v error -protocol_whitelist file \
+    -format_whitelist "${formats:-mov,matroska,mpegts,avi,mpeg}" \
+    -show_entries stream=index,codec_type,codec_name:stream_tags=language,title:stream_disposition=default,forced \
+    -of json -- "$pfile" 2>/dev/null) || probe='{"streams":[]}'
+  [[ $probe == \{*\} ]] || probe='{"streams":[]}'
+
+  PLAY_AUDIO_TRACKS=$(jq -c '
+    def langname:
+      ascii_downcase | {
+        en:"English", eng:"English", ja:"Japanese", jpn:"Japanese",
+        es:"Spanish", spa:"Spanish", fr:"French", fre:"French", fra:"French",
+        de:"German", ger:"German", deu:"German", it:"Italian", ita:"Italian",
+        pt:"Portuguese", por:"Portuguese", ru:"Russian", rus:"Russian",
+        ko:"Korean", kor:"Korean", zh:"Chinese", chi:"Chinese", zho:"Chinese",
+        ar:"Arabic", ara:"Arabic", hi:"Hindi", hin:"Hindi", pl:"Polish", pol:"Polish",
+        tr:"Turkish", tur:"Turkish", nl:"Dutch", dut:"Dutch", nld:"Dutch",
+        sv:"Swedish", swe:"Swedish", uk:"Ukrainian", ukr:"Ukrainian",
+        vi:"Vietnamese", vie:"Vietnamese", th:"Thai", tha:"Thai",
+        he:"Hebrew", heb:"Hebrew", cs:"Czech", ces:"Czech", cze:"Czech",
+        da:"Danish", dan:"Danish", fi:"Finnish", fin:"Finnish",
+        no:"Norwegian", nor:"Norwegian", el:"Greek", gre:"Greek", ell:"Greek",
+        hu:"Hungarian", hun:"Hungarian", ro:"Romanian", rum:"Romanian", ron:"Romanian",
+        id:"Indonesian", ind:"Indonesian", und:"Unknown"
+      }[.] // ascii_upcase;
+    def clean: tostring | gsub("[\u0000-\u001f\u007f-\u009f\t\r\n]"; " ") | gsub("  +"; " ") | sub("^ ";"") | sub(" $";"") | .[0:80];
+    [(.streams // [])[] | select(.codec_type == "audio")] | .[0:32] | to_entries | map(
+      .key as $k | .value as $s |
+      ($s.tags.language // $s.tags.LANGUAGE // "" | clean) as $rawlang |
+      (if $rawlang != "" then ($rawlang | langname) else "" end) as $lang |
+      ($s.tags.title // $s.tags.TITLE // "" | clean) as $title |
+      ($s.codec_name // "" | clean | ascii_upcase) as $codec |
+      (if $lang != "" and $title != "" and (($title | ascii_downcase) != ($lang | ascii_downcase)) then "\($lang) · \($title)"
+       elif $title != "" then $title
+       elif $lang != "" then $lang
+       elif $codec != "" then "Track \($k + 1) (\($codec))"
+       else "Track \($k + 1)" end) as $lbl |
+      {index: ($k + 1), label: ($lbl | clean), default: (($s.disposition.default // 0) == 1)}
+    )' <<<"$probe" 2>/dev/null) || PLAY_AUDIO_TRACKS='[]'
+  PLAY_AUDIO_COUNT=$(uint "$(jq 'length' <<<"$PLAY_AUDIO_TRACKS" 2>/dev/null)")
+  if ((PLAY_AUDIO_COUNT > 0)); then
+    PLAY_AUDIO_DEFAULT=$(uint "$(jq '(first(.[] | select(.default) | .index) // 1)' <<<"$PLAY_AUDIO_TRACKS" 2>/dev/null)")
+  fi
+
+  mapfile -t sidecars < <(subtitles_for "$orig")
+  stem=${orig%.*}
+  sc_json='[]'
+  idx=0
+  for s in "${sidecars[@]}"; do
+    [[ -n $s ]] || continue
+    PLAY_SUB_PATHS[idx]=$s
+    ext=${s##*.}
+    lang=${s#"$stem".}
+    lang=${lang%."$ext"}
+    if [[ $s == "$stem.$ext" ]]; then
+      lbl="External (${ext,,})"
+    else
+      lbl="$lang (file)"
+    fi
+    lbl=$(clean_text 80 <<<"$lbl")
+    sc_json=$(jq -c --arg id "sidecar:$idx" --arg lbl "$lbl" '. + [{id: $id, label: $lbl}]' <<<"$sc_json")
+    idx=$((idx + 1))
+  done
+
+  emb_json=$(jq -c '
+    def langname:
+      ascii_downcase | {
+        en:"English", eng:"English", ja:"Japanese", jpn:"Japanese",
+        es:"Spanish", spa:"Spanish", fr:"French", fre:"French", fra:"French",
+        de:"German", ger:"German", deu:"German", it:"Italian", ita:"Italian",
+        pt:"Portuguese", por:"Portuguese", ru:"Russian", rus:"Russian",
+        ko:"Korean", kor:"Korean", zh:"Chinese", chi:"Chinese", zho:"Chinese",
+        ar:"Arabic", ara:"Arabic", hi:"Hindi", hin:"Hindi", pl:"Polish", pol:"Polish",
+        tr:"Turkish", tur:"Turkish", nl:"Dutch", dut:"Dutch", nld:"Dutch",
+        sv:"Swedish", swe:"Swedish", uk:"Ukrainian", ukr:"Ukrainian",
+        vi:"Vietnamese", vie:"Vietnamese", th:"Thai", tha:"Thai",
+        he:"Hebrew", heb:"Hebrew", cs:"Czech", ces:"Czech", cze:"Czech",
+        da:"Danish", dan:"Danish", fi:"Finnish", fin:"Finnish",
+        no:"Norwegian", nor:"Norwegian", el:"Greek", gre:"Greek", ell:"Greek",
+        hu:"Hungarian", hun:"Hungarian", ro:"Romanian", rum:"Romanian", ron:"Romanian",
+        id:"Indonesian", ind:"Indonesian", und:"Unknown"
+      }[.] // ascii_upcase;
+    def clean: tostring | gsub("[\u0000-\u001f\u007f-\u009f\t\r\n]"; " ") | gsub("  +"; " ") | sub("^ ";"") | sub(" $";"") | .[0:80];
+    def textsub: . == "subrip" or . == "srt" or . == "ass" or . == "ssa" or . == "webvtt" or . == "mov_text" or . == "text";
+    [(.streams // [])[] | select(.codec_type == "subtitle")] | to_entries
+    | map(select((.value.codec_name // "") | textsub)) | .[0:32] | map(
+      .key as $sidx | .value as $s |
+      ($s.tags.language // $s.tags.LANGUAGE // "" | clean) as $rawlang |
+      (if $rawlang != "" then ($rawlang | langname) else "" end) as $lang |
+      ($s.tags.title // $s.tags.TITLE // "" | clean) as $title |
+      (if ($s.disposition.forced // 0) == 1 then " (Forced)" else "" end) as $forced |
+      (if $lang != "" and $title != "" and (($title | ascii_downcase) != ($lang | ascii_downcase)) then "\($lang) · \($title)"
+       elif $title != "" then $title
+       elif $lang != "" then $lang
+       else "Subtitles \($sidx + 1)" end) as $base |
+      {id: "emb:\($sidx)", sidx: $sidx, codec: ($s.codec_name // "subrip"), label: (($base + $forced) | clean)}
+    )' <<<"$probe" 2>/dev/null) || emb_json='[]'
+
+  while IFS=$'\t' read -r sidx codec; do
+    [[ $sidx =~ ^[0-9]{1,3}$ && -n $codec ]] || continue
+    PLAY_SUB_EMB_CODEC[sidx]=$codec
+  done < <(jq -r '.[] | "\(.sidx)\t\(.codec)"' <<<"$emb_json" 2>/dev/null)
+
+  PLAY_SUB_TRACKS=$(jq -cn --argjson sc "$sc_json" --argjson emb "$emb_json" '
+    ($sc + ($emb | map({id, label}))) as $all |
+    if ($all | length) > 0 then [{id: "off", label: "Off"}] + $all else [] end')
+}
+
+# pin_sidecar_file <sidecar-path> <video-path> <video-fd-path> <video-file-id>:
+# safely copy a vetted same-dir sidecar into PLAY_DIR/subs.XXXXXX.
+pin_sidecar_file() {
+  local sub=$1 file=$2 p=$3 want=$4 real fd vreal sreal ext sdir sname ok=1
+  real=$(readlink -f -- "$sub") || return 1
+  [[ ${real%/*} == "${file%/*}" ]] || return 1
+  open_regular "$sub" || return 1
+  fd=$OPEN_FD
+  vreal="" sreal=""
+  IFS= read -r -d '' vreal < <(readlink -z -- "$p" 2>/dev/null)
+  IFS= read -r -d '' sreal < <(readlink -z -- "/proc/$BASHPID/fd/$fd" 2>/dev/null)
+  ext=${sub##*.}
+  ext=${ext,,}
+  sname=${sub##*/}
+  # go2tv puts this path into an ffmpeg filter when it transcodes and
+  # mis-escapes quotes there, so any name beyond plain characters is replaced.
+  [[ $sname =~ ^[A-Za-z0-9\ ._-]+$ ]] || sname=subtitles.$ext
+  if [[ -n $vreal && $sreal == "$real" && ${sreal%/*} == "${vreal%/*}" && $ext =~ ^(srt|vtt|ass|ssa)$ ]] &&
+    [[ $(file_id "/proc/$BASHPID/fd/$fd") != "$want" ]] && only_mine "/proc/$BASHPID/fd/$fd"; then
+    if (($(stat -L -c %s -- "/proc/$BASHPID/fd/$fd" 2>/dev/null || echo "$MAX_SUBS") < MAX_SUBS)) &&
+      sdir=$(mktemp -d "$PLAY_DIR/subs.XXXXXX") &&
+      head -c "$MAX_SUBS" <&"$fd" >"$sdir/$sname"; then
+      if subs_ok "$sdir/$sname" "$ext"; then
+        PLAY_SUBS=$sdir/$sname
+        PLAY_SUBS_SRC=$sreal
+        ok=0
+      else
+        rm -rf -- "$sdir"
+      fi
+    fi
+  fi
+  exec {fd}<&-
+  return "$ok"
+}
+
+# extract_embedded_sub <pinned-media-file> <sub-stream-ordinal> <codec>:
+# extract an embedded text subtitle track into PLAY_DIR/subs.XXXXXX and validate it.
+extract_embedded_sub() {
+  local pfile=$1 sidx=$2 codec=$3 formats ext out_codec out_fmt sdir sname sz
+  [[ $sidx =~ ^[0-9]{1,3}$ ]] || return 1
+  case $codec in
+    ass | ssa) ext=ass out_codec=copy out_fmt=ass ;;
+    webvtt) ext=vtt out_codec=webvtt out_fmt=webvtt ;;
+    subrip | srt | mov_text | text) ext=srt out_codec=srt out_fmt=srt ;;
+    *) return 1 ;;
+  esac
+  formats=$(sed -n 's/^FORMATS=//p' "${SELF%/*}/tvcast-ffwrap" 2>/dev/null)
+  sdir=$(mktemp -d "$PLAY_DIR/subs.XXXXXX") || return 1
+  sname="subtitles.$ext"
+  if timeout 15 ffmpeg -v error -nostdin -protocol_whitelist file \
+    -format_whitelist "${formats:-mov,matroska,mpegts,avi,mpeg}" \
+    -i "$pfile" -map "0:s:$sidx" -c:s "$out_codec" -f "$out_fmt" - 2>/dev/null | head -c "$MAX_SUBS" >"$sdir/$sname"; then
+    sz=$(stat -c %s -- "$sdir/$sname" 2>/dev/null || echo 0)
+    if ((sz > 0 && sz < MAX_SUBS)) && subs_ok "$sdir/$sname" "$ext"; then
+      PLAY_SUBS=$sdir/$sname
+      PLAY_SUBS_SRC="embedded:$sidx"
+      return 0
+    fi
+  fi
+  rm -rf -- "$sdir"
+  return 1
+}
+
+# pin_media <file> <file-id> [want-sub]: on success sets PLAY_FILE (and PLAY_SUBS
+# for a video with selected/default captions), PLAY_KIND and track metadata;
+# on failure PIN_ERR says why.
 pin_media() {
-  local file=$1 want=$2 p mime sub real fd vreal sreal ext sdir sname
+  local file=$1 want=$2 want_sub=${3:-} p mime idx codec
   unpin
   PIN_ERR="it was queued by an older version of tvcast. Add it again."
   [[ $want =~ $FILE_ID_RE ]] || return 1
@@ -1459,39 +1667,28 @@ pin_media() {
   ln -s -- "$p" "$PLAY_FILE" || { unpin; return 1; }
   PIN_ERR=""
   [[ $PLAY_KIND == video ]] || return 0
-  sub=$(subtitle_for "$file")
-  [[ -n $sub ]] || return 0
-  # Only a sidecar that really lives next to the video, never one that links
-  # elsewhere. The path can change after any check on it, so the sidecar is
-  # opened first and the decision is made on the open descriptors: where the
-  # opened file is, compared with where the opened video is.
-  real=$(readlink -f -- "$sub") || return 0
-  [[ ${real%/*} == "${file%/*}" ]] || return 0
-  open_regular "$sub" || return 0
-  fd=$OPEN_FD
-  vreal="" sreal=""
-  IFS= read -r -d '' vreal < <(readlink -z -- "$p" 2>/dev/null)
-  IFS= read -r -d '' sreal < <(readlink -z -- "/proc/$BASHPID/fd/$fd" 2>/dev/null)
-  ext=${sub##*.}
-  ext=${ext,,}
-  sname=${sub##*/}
-  # go2tv puts this path into an ffmpeg filter when it transcodes and
-  # mis-escapes quotes there, so any name beyond plain characters is replaced.
-  [[ $sname =~ ^[A-Za-z0-9\ ._-]+$ ]] || sname=subtitles.$ext
-  if [[ -n $vreal && $sreal == "$real" && ${sreal%/*} == "${vreal%/*}" && $ext =~ ^(srt|vtt|ass|ssa)$ ]] &&
-    [[ $(file_id "/proc/$BASHPID/fd/$fd") != "$want" ]] && only_mine "/proc/$BASHPID/fd/$fd"; then
-    if (($(stat -L -c %s -- "/proc/$BASHPID/fd/$fd" 2>/dev/null || echo "$MAX_SUBS") < MAX_SUBS)) &&
-      sdir=$(mktemp -d "$PLAY_DIR/subs.XXXXXX") &&
-      head -c "$MAX_SUBS" <&"$fd" >"$sdir/$sname"; then
-      if subs_ok "$sdir/$sname" "$ext"; then
-        PLAY_SUBS=$sdir/$sname
-        PLAY_SUBS_SRC=$sreal
-      else
-        rm -rf -- "$sdir"
-      fi
-    fi
-  fi
-  exec {fd}<&-
+
+  probe_tracks "$PLAY_FILE" "$file"
+  PLAY_ACTIVE_SUB="off"
+  case $want_sub in
+    off)
+      return 0 ;;
+    sidecar:[0-9]*)
+      idx=${want_sub#sidecar:}
+      if [[ $idx =~ ^[0-9]{1,3}$ && -n ${PLAY_SUB_PATHS[idx]:-} ]]; then
+        pin_sidecar_file "${PLAY_SUB_PATHS[idx]}" "$file" "$p" "$want" && PLAY_ACTIVE_SUB="sidecar:$idx"
+      fi ;;
+    emb:[0-9]*)
+      idx=${want_sub#emb:}
+      codec=${PLAY_SUB_EMB_CODEC[idx]:-}
+      if [[ -n $codec ]]; then
+        extract_embedded_sub "$PLAY_FILE" "$idx" "$codec" && PLAY_ACTIVE_SUB="emb:$idx"
+      fi ;;
+    "")
+      if [[ -n ${PLAY_SUB_PATHS[0]:-} ]]; then
+        pin_sidecar_file "${PLAY_SUB_PATHS[0]}" "$file" "$p" "$want" && PLAY_ACTIVE_SUB="sidecar:0"
+      fi ;;
+  esac
   return 0
 }
 
@@ -1520,7 +1717,10 @@ q_read() {
     (if type == "object" then . else {} end)
     | .items = [(if (.items | type) == "array" then .items[] else empty end)
                 | select(type == "object" and (.file | type) == "string")
-                | .title = (.title | if type == "string" then . else "" end)]
+                | .title = (.title | if type == "string" then . else "" end)
+                | .audio = ((.audio // 0) | (tonumber? // 0) | floor | if . >= 0 and . < 1000 then . else 0 end)
+                | .subtitle = (.subtitle | if type == "string" and test("^(off|sidecar:[0-9]{1,3}|emb:[0-9]{1,3})$") then . else "" end)
+                | .resumeAt = ((.resumeAt // 0) | (tonumber? // 0) | floor | if . >= 0 and . < 1000000000 then . else 0 end)]
     | .items |= [to_entries[] | .key as $i | .value | .key = (.key | if okkey then . else "p\($i)" end)]
     | if ([.items[].key] | unique | length) == (.items | length) then .
       else .items |= ([to_entries[] | {i: .key, v: .value}] | group_by(.v.key)
@@ -1822,8 +2022,9 @@ nap() { sleep "$1" & wait $!; } # interruptible by the TERM trap
 # Images advance after TVCAST_IMAGE_SECONDS unless last; one the TV never
 # reported playing returns 4 (moved on, not seen), so it never counts as played.
 wait_item_end() {
-  local kind=$1 last=$2 blind=${3:-} saw=0 ends=0 others=0 t=0 st="" pos dur at_end served="" lpos=0 ldur=0 lt=0 lst="" flen=0
+  local kind=$1 last=$2 blind=${3:-} resume_at=${4:-0} saw=0 ends=0 others=0 t=0 st="" pos dur at_end served="" lpos=0 ldur=0 lt=0 lst="" flen=0 resumed=0
   local poll=${TVCAST_POLL_SECONDS:-2} start_timeout=${TVCAST_START_TIMEOUT:-90}
+  resume_at=$(uint "$resume_at")
   [[ -n $blind && $kind != image ]] && flen=$(media_seconds "$PLAY_FILE")
   while :; do
     nap "$poll"
@@ -1859,7 +2060,12 @@ wait_item_end() {
     read -r st pos dur < <(dev_status 2>/dev/null) || true
     at_end=0
     case $st in
-      PLAYING | PAUSED_PLAYBACK) saw=1 lpos=$pos ldur=$dur lt=$SECONDS lst=$st ;;
+      PLAYING | PAUSED_PLAYBACK)
+        saw=1 lpos=$pos ldur=$dur lt=$SECONDS lst=$st
+        if ((resume_at > 2 && !resumed)) && [[ $st == PLAYING ]] && ((dur == 0 || resume_at < dur - 2)); then
+          resumed=1
+          dev_control seek "abs:$resume_at" >/dev/null 2>&1 || true
+        fi ;;
       STOPPED | NO_MEDIA_PRESENT) ((saw)) && at_end=1 ;;
     esac
     if [[ $st == OTHER ]] && ((saw)); then others=$((others + 1)); else others=0; fi
@@ -1893,7 +2099,7 @@ sweep_temps() {
 cmd_run() {
   trap 'kill_player; unpin' EXIT
   trap 'exit 0' TERM INT
-  local q count idx item file fid key title kind tc args name url last blind="" rc first="" first_key="" played=0 failed=0 unseen=0
+  local q count idx item file fid key title kind tc args name url last blind="" rc first="" first_key="" played=0 failed=0 unseen=0 want_audio=0 active_audio=0 want_sub="" resume_at=0
   export TVCAST_IN_RUNNER=1
   rm -rf -- "$CACHE_DIR"/play.*
   sweep_temps
@@ -1943,6 +2149,9 @@ cmd_run() {
     fid=$(jq -r '.id // empty' <<<"$item")
     key=$(jq -r '.key // empty' <<<"$item")
     title=$(jq -r .title <<<"$item")
+    want_audio=$(uint "$(jq -r '.audio // 0' <<<"$item")")
+    want_sub=$(jq -r '.subtitle // empty' <<<"$item")
+    resume_at=$(uint "$(jq -r '.resumeAt // 0' <<<"$item")")
     url=$(jq -r '.device.url // empty' <<<"$q")
     # The queue file is re-read on every item; never hand go2tv a URL that
     # wouldn't pass discovery.
@@ -1956,7 +2165,7 @@ cmd_run() {
     [[ $ADEV_TYPE == chromecast ]] || blind=""
     rm -f "$CC_STATUS_FILE"
 
-    if ! pin_media "$file" "$fid"; then
+    if ! pin_media "$file" "$fid" "$want_sub"; then
       failed=$((failed + 1))
       # A long stale queue must not raise one notification per item.
       ((failed <= 3)) && notify normal "Cast to TV" "Skipping $title: $PIN_ERR"
@@ -1984,26 +2193,45 @@ cmd_run() {
     require_go2tv
     args=(-v "$PLAY_FILE" -t "$ADEV_URL")
     tc=0
+    active_audio=$PLAY_AUDIO_DEFAULT
     if [[ $kind == video ]]; then
       [[ -n $PLAY_SUBS ]] && args+=(-s "$PLAY_SUBS")
-      # go2tv picks Chromecast transcoding itself; the codec lists here are
-      # for DLNA TVs, so on a Chromecast only TVCAST_TRANSCODE=always forces it.
+      if ((want_audio > 0 && want_audio <= PLAY_AUDIO_COUNT)); then
+        active_audio=$want_audio
+        if ((want_audio != PLAY_AUDIO_DEFAULT)); then
+          args+=(-a "$want_audio")
+          tc=1
+        fi
+      fi
+      # go2tv picks Chromecast video transcoding itself but passes AC3/DTS
+      # audio through, which a Google TV plays silently; only audio is checked.
       if [[ $ADEV_TYPE == chromecast ]]; then
-        [[ ${TVCAST_TRANSCODE:-} == always ]] && { args+=(-tc); tc=1; }
-      elif needs_transcode "$PLAY_FILE"; then
+        if ((tc == 0)) && { [[ ${TVCAST_TRANSCODE:-} == always ]] || { [[ ${TVCAST_TRANSCODE:-} != never ]] && needs_transcode "$PLAY_FILE" audio; }; }; then
+          args+=(-tc)
+          tc=1
+        fi
+      elif ((tc == 0)) && needs_transcode "$PLAY_FILE"; then
         args+=(-tc)
         tc=1
       fi
     fi
     last=$((idx + 1 >= count ? 1 : 0))
 
-    q_update --arg k "$key" '.playing = $k' || { write_state '{"active":false}'; die "$SAVE_ERR"; }
+    if ((resume_at > 0)); then
+      q_update --arg k "$key" "$KEYPOS"' .playing = $k | (keypos($k) as $p | if $p != null then .items[$p].resumeAt = 0 else . end)' ||
+        { write_state '{"active":false}'; die "$SAVE_ERR"; }
+    else
+      q_update --arg k "$key" '.playing = $k' || { write_state '{"active":false}'; die "$SAVE_ERR"; }
+    fi
     write_state "$(jq -cn --arg title "$title" --arg file "$file" --arg kind "$kind" --arg key "$key" \
       --arg device "$ADEV_URL" --arg name "$name" --arg control "$ADEV_CTL" --arg subs "$PLAY_SUBS_SRC" --arg type "$ADEV_TYPE" \
       --argjson transcode "$tc" --argjson started "$(date +%s)" --argjson index "$idx" --argjson count "$count" \
+      --argjson audio "$active_audio" --argjson audioTracks "$PLAY_AUDIO_TRACKS" \
+      --arg subtitle "$PLAY_ACTIVE_SUB" --argjson subtitleTracks "$PLAY_SUB_TRACKS" \
       '{active: true, title: $title, file: $file, kind: $kind, key: $key, device: $device, deviceName: $name,
         type: $type, control: $control, subtitles: $subs, transcode: ($transcode == 1), started: $started,
-        index: $index, count: $count}')" ||
+        index: $index, count: $count, audio: $audio, audioTracks: $audioTracks,
+        subtitle: $subtitle, subtitleTracks: $subtitleTracks}')" ||
       die "Could not write $STATE_FILE (is the disk full?), so tvcast could not keep track of the cast. Nothing was sent to the TV."
     if ((count > 1)); then
       notify low "Casting $((idx + 1))/$count to $name" "$title"
@@ -2015,7 +2243,7 @@ cmd_run() {
     PLAYER_PID=$!
 
     rc=0
-    wait_item_end "$kind" "$last" "$blind" || rc=$?
+    wait_item_end "$kind" "$last" "$blind" "$resume_at" || rc=$?
     kill_player
     unpin
     rm -f -- "$CAST_MEDIA_FILE"
@@ -2326,6 +2554,10 @@ cmd_list() {
     title: ($st.title // (.items[$i].title // "")),
     kind: ($st.kind // ""),
     transcode: ($st.transcode // false),
+    audio: ($st.audio // 0),
+    audioTracks: ($st.audioTracks // []),
+    subtitle: ($st.subtitle // "off"),
+    subtitleTracks: ($st.subtitleTracks // []),
     items: [.items | to_entries[] | {n: (.key + 1), title: .value.title, kind: .value.kind, file: .value.file, key: .value.key}]
   }'
 }
@@ -2426,10 +2658,72 @@ cmd_mute() {
   dev_set_mute "$on" || die "This TV doesn't offer volume control."
 }
 
+cmd_tracks() {
+  local st=""
+  is_active && [[ -s $STATE_FILE ]] && st=$(jq -c 'if type == "object" then . else empty end' "$STATE_FILE" 2>/dev/null)
+  [[ -n $st ]] || { echo "Nothing is casting."; return 1; }
+  jq -r '
+    "Audio:",
+    (if (.audioTracks // [] | length) == 0 then "  (none)"
+     else .audio as $a | (.audioTracks[] | "  \(if .index == $a then "*" else " " end) \(.index)  \(.label)") end),
+    "Subtitles:",
+    (if (.subtitleTracks // [] | length) == 0 then "  (none)"
+     else (.subtitle // "off") as $s | (.subtitleTracks[] | "  \(if .id == $s then "*" else " " end) \(.id)  \(.label)") end)
+  ' <<<"$st"
+}
+
+switch_track() {
+  local field=$1 val=$2 key=${3:-} pos=0 dur=0 act=false
+  [[ -z $key || $key =~ $KEY_RE ]] || { echo "tvcast: invalid item key" >&2; return 2; }
+  (($(q_count) > 0)) || die "The queue is empty."
+  if [[ -n $key && $(q_get --arg k "$key" "$KEYPOS keypos(\$k)") == null ]]; then
+    notify low "Cast to TV" "That item is no longer in the queue."
+    return 1
+  fi
+  if is_active; then
+    act=true
+    read -r pos dur < <(position_info 2>/dev/null) || pos=0 dur=0
+    ((dur == 0)) && pos=0
+  fi
+  resolve_device || return 0
+  transition_lock
+  if [[ -n $key && $(q_get --arg k "$key" "$KEYPOS keypos(\$k)") == null ]]; then
+    notify low "Cast to TV" "That item is no longer in the queue."
+    return 1
+  fi
+  is_active && act=true || act=false
+  if [[ $act == true ]]; then
+    stop_or_die "$STOP_ERR"
+  fi
+  if [[ $field == audio ]]; then
+    q_update --argjson v "$val" --argjson pos "$pos" --argjson act "$act" --arg k "$key" "${DEV_ARGS[@]}" \
+      "$CUR $KEYPOS (if \$k != \"\" then (keypos(\$k) // error(\"gone\")) else cur(\$act) end) as \$p |
+       .index = \$p | .items[\$p].audio = \$v | .items[\$p].resumeAt = \$pos | .playing = null | $DEV_SET" || die "$SAVE_STOPPED_ERR"
+  else
+    q_update --arg v "$val" --argjson pos "$pos" --argjson act "$act" --arg k "$key" "${DEV_ARGS[@]}" \
+      "$CUR $KEYPOS (if \$k != \"\" then (keypos(\$k) // error(\"gone\")) else cur(\$act) end) as \$p |
+       .index = \$p | .items[\$p].subtitle = \$v | .items[\$p].resumeAt = \$pos | .playing = null | $DEV_SET" || die "$SAVE_STOPPED_ERR"
+  fi
+  [[ $act == true ]] && start_runner
+  return 0
+}
+
+cmd_audio() {
+  local n=${1:-} key=${2:-}
+  [[ $n =~ ^[1-9][0-9]{0,2}$ ]] || { echo "usage: tvcast audio <1-based track number> [key]" >&2; return 2; }
+  switch_track audio "$((10#$n))" "$key"
+}
+
+cmd_subtitle() {
+  local id=${1:-} key=${2:-}
+  [[ $id =~ ^(off|sidecar:[0-9]{1,3}|emb:[0-9]{1,3})$ ]] || { echo "usage: tvcast subtitle <off|sidecar:N|emb:N> [key]" >&2; return 2; }
+  switch_track subtitle "$id" "$key"
+}
+
 cmd_notify_status() { notify low "Cast to TV" "$(cmd_status)"; }
 
 case ${1:-cast} in
-  list | status | notify-status | active | has-queue | _stop-owned | help | -h | --help) ;;
+  list | status | tracks | notify-status | active | has-queue | _stop-owned | help | -h | --help) ;;
   *) ensure_dirs ;;
 esac
 
@@ -2453,6 +2747,9 @@ case ${1:-cast} in
   seek-to) shift; cmd_seek_to "$@" ;;
   volume) shift; cmd_volume "$@" ;;
   mute) shift; cmd_mute "$@" ;;
+  tracks) cmd_tracks ;;
+  audio) shift; cmd_audio "$@" ;;
+  subtitle | subs | captions) shift; cmd_subtitle "$@" ;;
   stop) cmd_stop ;;
   status) shift; cmd_status "$@" ;;
   notify-status) cmd_notify_status ;;
@@ -2461,6 +2758,6 @@ case ${1:-cast} in
   _run) cmd_run ;;
   _cleanup) cmd_cleanup ;;
   _stop-owned) stop_runner ;;
-  -h | --help | help) sed -n '3,31p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  -h | --help | help) sed -n '3,34p' "$SELF" | sed 's/^# \{0,1\}//' ;;
   *) echo "tvcast: unknown command '$1' (try tvcast help)" >&2; exit 2 ;;
 esac
