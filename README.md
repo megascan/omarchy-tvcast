@@ -27,8 +27,11 @@ RenderingControl, or over the Cast protocol for a Chromecast.
 - **Format check:** ffprobe decides whether a video needs transcoding. On a DLNA TV,
   H.264, HEVC, MPEG-2 and MPEG-4 video in MP4, MKV, MOV, TS or AVI with AAC, AC3,
   EAC3 or MP3 audio plays as-is. Everything else gets go2tv's ffmpeg transcode (`-tc`).
-  On a Chromecast, go2tv checks the video itself, and tvcast transcodes any audio
-  that isn't AAC, MP3, Opus, Vorbis or FLAC (Google TVs play AC3 and DTS as silence).
+  On a Chromecast, audio that isn't AAC, MP3, Opus, Vorbis or FLAC (Google TVs play
+  AC3 and DTS as silence) is converted to AAC while the video is copied untouched,
+  so 4K and HDR stay as they are. The cast starts while that copy is still being
+  written into `~/.cache/tvcast/` (it needs free space the size of the file), so
+  seeking only reaches the part already written. Other videos go through go2tv.
   go2tv encodes on the GPU (NVENC, VA-API or Quick Sync) when ffmpeg has a working
   hardware encoder, and falls back to libx264.
 - **Audio and subtitle tracks:** when a video has more than one audio track or any

@@ -1451,12 +1451,73 @@ PLAY_SUB_PATHS=() PLAY_SUB_EMB_CODEC=()
 MAX_SUBS=8388608
 
 unpin() {
+  stop_remux
   [[ -n $MEDIA_FD ]] && exec {MEDIA_FD}<&-
   [[ -n $PLAY_DIR ]] && rm -rf -- "$PLAY_DIR"
   MEDIA_FD="" PLAY_DIR="" PLAY_FILE="" PLAY_SUBS="" PLAY_SUBS_SRC="" PLAY_KIND=""
   PLAY_AUDIO_TRACKS='[]' PLAY_AUDIO_DEFAULT=0 PLAY_AUDIO_COUNT=0
   PLAY_SUB_TRACKS='[]' PLAY_ACTIVE_SUB='off'
   PLAY_SUB_PATHS=() PLAY_SUB_EMB_CODEC=()
+}
+
+# Chromecast: a video whose picture the TV plays but whose audio it can't
+# (AC3, EAC3, DTS, TrueHD) is remuxed: the video stream is copied untouched
+# and only the chosen audio track becomes AAC, into $PLAY_DIR/cc/. go2tv's own
+# -tc re-encodes the picture and its stream stops after a few seconds on
+# Google TVs. The cast starts while the remux is still writing (it runs far
+# faster than playback), so seeking only reaches what is already written.
+CC_VCODECS=" h264 hevc vp8 vp9 av1 "
+REMUX_PID=""
+stop_remux() {
+  [[ -n $REMUX_PID ]] || return 0
+  kill -TERM "$REMUX_PID" 2>/dev/null
+  wait "$REMUX_PID" 2>/dev/null
+  REMUX_PID=""
+}
+
+cc_video_ok() { # cc_video_ok <file>: the Chromecast decodes the first video stream as is
+  local formats v
+  formats=$(sed -n 's/^FORMATS=//p' "${SELF%/*}/tvcast-ffwrap" 2>/dev/null)
+  v=$(timeout 6 ffprobe -v error -protocol_whitelist file -format_whitelist "${formats:-mov,matroska,mpegts,avi,mpeg}" \
+    -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 -- "$1" 2>/dev/null | head -n1)
+  [[ -n $v && $CC_VCODECS == *" $v "* ]]
+}
+
+cc_audio_ok() { # cc_audio_ok <file> <track, 1-based>
+  local formats a
+  formats=$(sed -n 's/^FORMATS=//p' "${SELF%/*}/tvcast-ffwrap" 2>/dev/null)
+  a=$(timeout 6 ffprobe -v error -protocol_whitelist file -format_whitelist "${formats:-mov,matroska,mpegts,avi,mpeg}" \
+    -select_streams "a:$(($2 - 1))" -show_entries stream=codec_name -of csv=p=0 -- "$1" 2>/dev/null | head -n1)
+  [[ -z $a || $CC_ACODECS == *" $a "* ]]
+}
+
+# cc_remux <track, 1-based>: starts the remux of $PLAY_FILE and points
+# PLAY_FILE at the output once its start is written. Fails when ffmpeg dies
+# or writes nothing within 20 s.
+cc_remux() {
+  local track=$1 out formats real t=0 size
+  real=${TVCAST_FFMPEG:-$(command -v ffmpeg)} || return 1
+  formats=$(sed -n 's/^FORMATS=//p' "${SELF%/*}/tvcast-ffwrap" 2>/dev/null)
+  local need free
+  need=$(stat -L -c %s -- "$PLAY_FILE" 2>/dev/null) || return 1
+  free=$(df -B1 --output=avail -- "$PLAY_DIR" 2>/dev/null | tail -n1 | tr -d ' ')
+  [[ $free =~ ^[0-9]+$ ]] && ((free > need + 2 * 1024 * 1024 * 1024)) || return 1
+  mkdir -m 700 -- "$PLAY_DIR/cc" || return 1
+  out=$PLAY_DIR/cc/${PLAY_FILE##*/}
+  out=${out%.*}.mkv
+  nice -n 10 "$real" -v error -nostdin -protocol_whitelist file -format_whitelist "${formats:-mov,matroska,mpegts,avi,mpeg}" \
+    -i "$PLAY_FILE" -map 0:v:0 -map "0:a:$((track - 1))" -c:v copy -c:a aac -b:a 256k -ac 2 \
+    -f matroska -- "$out" </dev/null >/dev/null 2>>"$LOG_FILE.remux" &
+  REMUX_PID=$!
+  while ((t < 40)); do
+    nap 0.5
+    t=$((t + 1))
+    kill -0 "$REMUX_PID" 2>/dev/null || { size=$(stat -c %s -- "$out" 2>/dev/null || echo 0); ((size > 0)) && break; REMUX_PID=""; return 1; }
+    size=$(stat -c %s -- "$out" 2>/dev/null || echo 0)
+    ((size >= 64 * 1024 * 1024)) && break
+  done
+  [[ -s $out ]] || { stop_remux; return 1; }
+  PLAY_FILE=$out
 }
 
 # probe_tracks <pinned-media-file> <orig-file>: populate PLAY_AUDIO_TRACKS,
@@ -2203,12 +2264,24 @@ cmd_run() {
           tc=1
         fi
       fi
-      # go2tv picks Chromecast video transcoding itself but passes AC3/DTS
-      # audio through, which a Google TV plays silently; only audio is checked.
+      # Chromecast: go2tv's -tc stream stops after a few seconds on Google
+      # TVs, so audio the TV can't play is remuxed and the picture is sent as is.
       if [[ $ADEV_TYPE == chromecast ]]; then
-        if ((tc == 0)) && { [[ ${TVCAST_TRANSCODE:-} == always ]] || { [[ ${TVCAST_TRANSCODE:-} != never ]] && needs_transcode "$PLAY_FILE" audio; }; }; then
-          args+=(-tc)
+        local cc_track=$active_audio
+        ((cc_track > 0)) || cc_track=1
+        if [[ ${TVCAST_TRANSCODE:-} == always ]]; then
+          ((tc)) || args+=(-tc)
           tc=1
+        elif [[ ${TVCAST_TRANSCODE:-} != never ]] && cc_video_ok "$PLAY_FILE" &&
+          { ((tc)) || ! cc_audio_ok "$PLAY_FILE" "$cc_track"; }; then
+          notify low "Cast to TV" "Preparing the audio of $title for $name…"
+          if cc_remux "$cc_track"; then
+            args=(-v "$PLAY_FILE" -t "$ADEV_URL")
+            [[ -n $PLAY_SUBS ]] && args+=(-s "$PLAY_SUBS")
+            tc=0
+          else
+            notify normal "Cast to TV" "Could not prepare the audio of $title; it plays without changes (low disk space? see $LOG_FILE.remux)."
+          fi
         fi
       elif ((tc == 0)) && needs_transcode "$PLAY_FILE"; then
         args+=(-tc)
