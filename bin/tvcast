@@ -2082,6 +2082,13 @@ nap() { sleep "$1" & wait $!; } # interruptible by the TERM trap
 # than that length.
 # Images advance after TVCAST_IMAGE_SECONDS unless last; one the TV never
 # reported playing returns 4 (moved on, not seen), so it never counts as played.
+# go2tv_screen: the last state go2tv's own screen showed (Playing, Paused,
+# Stopped), from the end of its log.
+go2tv_screen() {
+  tail -c 4096 -- "$LOG_FILE" 2>/dev/null | LC_ALL=C sed 's/\x1b\[[0-9;?>]*[a-zA-Z]//g' |
+    LC_ALL=C grep -aoE 'Playing|Paused|Stopped' | tail -n1
+}
+
 wait_item_end() {
   local kind=$1 last=$2 blind=${3:-} resume_at=${4:-0} saw=0 ends=0 others=0 t=0 st="" pos dur at_end served="" lpos=0 ldur=0 lt=0 lst="" flen=0 resumed=0
   local poll=${TVCAST_POLL_SECONDS:-2} start_timeout=${TVCAST_START_TIMEOUT:-90}
@@ -2119,6 +2126,14 @@ wait_item_end() {
     if [[ $ADEV_TYPE == chromecast && -z $served ]] && note_served "$PLAYER_PID" "${PLAY_FILE##*/}"; then served=1; fi
     st="" pos=0 dur=0
     read -r st pos dur < <(dev_status 2>/dev/null) || true
+    # Some renderers (TCL Google TV) answer every poll with STOPPED and no
+    # track while they play; go2tv gets the real state from their events.
+    if [[ $ADEV_TYPE == dlna && $st != PLAYING && $st != PAUSED_PLAYBACK ]]; then
+      case $(go2tv_screen) in
+        Playing) st=PLAYING pos=0 dur=0 ;;
+        Paused) st=PAUSED_PLAYBACK pos=0 dur=0 ;;
+      esac
+    fi
     at_end=0
     case $st in
       PLAYING | PAUSED_PLAYBACK)
