@@ -45,6 +45,7 @@ CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/tvcast
 STATE_FILE=$CACHE_DIR/state.json
 DEVICE_FILE=$CACHE_DIR/device
 LOG_FILE=$CACHE_DIR/session.log
+CLOCK_FILE=$CACHE_DIR/clock
 STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/tvcast
 QUEUE_FILE=$STATE_DIR/queue.json
 LOCK_FILE=$STATE_DIR/lock
@@ -228,7 +229,10 @@ xpath_str() { # xpath_str <expr>, XML on stdin
 MAX_BODY=1048576
 # -q: ignore ~/.curlrc; --noproxy: device requests never go through a proxy.
 # -g: brackets and braces in a device URL are literal, never a curl URL range.
-CURL=(curl -q -g --noproxy '*' --proto '=http,https' --max-redirs 0 --max-filesize "$MAX_BODY")
+# -A: go2tv's User-Agent. Some renderers (the TCL Google TV's Platinum DMR)
+# keep one session per User-Agent and answer any other client from a stale
+# one: STOPPED, position 0, and 718 for Play, Pause and Seek.
+CURL=(curl -q -g --noproxy '*' --proto '=http,https' --max-redirs 0 --max-filesize "$MAX_BODY" -A 'Go-http-client/1.1')
 
 fetch() { "${CURL[@]}" "$@" | head -c "$MAX_BODY"; } # fetch <curl args...>
 
@@ -673,7 +677,45 @@ transport_state() {
   local st
   st=$(soap GetTransportInfo | xpath_str "//*[local-name()='CurrentTransportState']")
   [[ $st =~ ^[A-Z_]{1,40}$ ]] || st=UNKNOWN
+  if [[ $st != PLAYING && $st != PAUSED_PLAYBACK && -f $CLOCK_FILE ]]; then
+    case $(go2tv_screen) in
+      Playing) st=PLAYING ;;
+      Paused) st=PAUSED_PLAYBACK ;;
+    esac
+  fi
   printf '%s\n' "$st"
+}
+
+# Position clock for DLNA TVs that report position 0 or no duration while they
+# play (the TCL Google TV, at times): CLOCK_FILE holds "pos stamp dur",
+# kept by the runner (clock_tick), reset by seeks, and only while an item plays.
+clock_read() {
+  local pos stamp dur
+  [[ -f $CLOCK_FILE ]] || return 1
+  read -r pos stamp dur <"$CLOCK_FILE" 2>/dev/null || return 1
+  [[ $pos =~ ^[0-9]{1,9}$ && $stamp =~ ^[0-9]{1,12}$ && $dur =~ ^[0-9]{1,9}$ ]] || return 1
+  printf '%s %s %s\n' "$((10#$pos))" "$((10#$stamp))" "$((10#$dur))"
+}
+clock_set() { # clock_set <pos> [dur]
+  local _p _s dur=${2:-}
+  [[ -n $dur ]] || read -r _p _s dur < <(clock_read) || return 0
+  ((dur > 0 && $1 > dur)) && set -- "$dur"
+  printf '%s %s %s\n' "$1" "$EPOCHSECONDS" "${dur:-0}" >"$CLOCK_FILE.$$" && mv -f -- "$CLOCK_FILE.$$" "$CLOCK_FILE"
+}
+clock_now() { # clock_now <state>: the clock's position, advanced while playing
+  local pos stamp dur
+  read -r pos stamp dur < <(clock_read) || return 1
+  [[ $1 == PLAYING ]] && ((EPOCHSECONDS > stamp)) && pos=$((pos + EPOCHSECONDS - stamp))
+  ((dur > 0 && pos > dur)) && pos=$dur
+  printf '%s %s\n' "$pos" "$dur"
+}
+clock_tick() { # clock_tick <state> <tv-pos> <tv-dur>
+  local pos dur
+  [[ -f $CLOCK_FILE ]] || return 0
+  read -r pos dur < <(clock_now "$1") || return 0
+  (($2 > 0)) && pos=$2
+  (($3 > 0)) && dur=$3
+  clock_set "$pos" "$dur"
 }
 
 # position_info: prints "<pos-seconds> <duration-seconds>". Fails when the
@@ -687,9 +729,14 @@ position_info() {
     echo "$pos $dur"
     return
   fi
-  xml=$(soap GetPositionInfo) || return 1
-  pos=$(hms_to_s "$(xpath_str "//*[local-name()='RelTime']" <<<"$xml")") || return 1
+  local cpos cdur
+  xml=$(soap GetPositionInfo) && pos=$(hms_to_s "$(xpath_str "//*[local-name()='RelTime']" <<<"$xml")") || pos=""
   dur=$(hms_to_s "$(xpath_str "//*[local-name()='TrackDuration']" <<<"$xml")") || dur=0
+  if read -r cpos cdur < <(clock_now "$(go2tv_state)"); then
+    ((${pos:-0} > 0)) || pos=$cpos
+    ((dur > 0)) || dur=$cdur
+  fi
+  [[ -n $pos ]] || return 1
   echo "$pos $dur"
 }
 
@@ -934,6 +981,7 @@ dlna_seek_once() {
     [[ -n $paused ]] && repause
     return 1
   fi
+  clock_set "$1"
   if [[ -n $paused ]]; then
     sleep 1
     repause || { SEEK_ERR="The TV seeked but kept playing: it did not take Pause."; return 1; }
@@ -2084,9 +2132,27 @@ nap() { sleep "$1" & wait $!; } # interruptible by the TERM trap
 # reported playing returns 4 (moved on, not seen), so it never counts as played.
 # go2tv_screen: the last state go2tv's own screen showed (Playing, Paused,
 # Stopped), from the end of its log.
+go2tv_state() {
+  case $(go2tv_screen) in
+    Playing) echo PLAYING ;;
+    Paused) echo PAUSED_PLAYBACK ;;
+    *) echo STOPPED ;;
+  esac
+}
+
 go2tv_screen() {
   tail -c 4096 -- "$LOG_FILE" 2>/dev/null | LC_ALL=C sed 's/\x1b\[[0-9;?>]*[a-zA-Z]//g' |
     LC_ALL=C grep -aoE 'Playing|Paused|Stopped' | tail -n1
+}
+
+# stop_confirmed <ends> <last-pos> <last-dur> <last-seen>: a DLNA TV that
+# reports STOPPED well before the end may just be seeking (the TCL Google TV
+# does while it rebuffers), so that needs TVCAST_STOP_CONFIRM seconds of it.
+stop_confirmed() {
+  local ends=$1 lpos=$2 ldur=$3 lt=$4 poll=${TVCAST_POLL_SECONDS:-2}
+  [[ $ADEV_TYPE == dlna ]] || return 0
+  ((ldur > 0 && lpos + SECONDS - lt + 15 >= ldur)) && return 0
+  ((ends * poll >= ${TVCAST_STOP_CONFIRM:-20}))
 }
 
 wait_item_end() {
@@ -2126,14 +2192,7 @@ wait_item_end() {
     if [[ $ADEV_TYPE == chromecast && -z $served ]] && note_served "$PLAYER_PID" "${PLAY_FILE##*/}"; then served=1; fi
     st="" pos=0 dur=0
     read -r st pos dur < <(dev_status 2>/dev/null) || true
-    # Some renderers (TCL Google TV) answer every poll with STOPPED and no
-    # track while they play; go2tv gets the real state from their events.
-    if [[ $ADEV_TYPE == dlna && $st != PLAYING && $st != PAUSED_PLAYBACK ]]; then
-      case $(go2tv_screen) in
-        Playing) st=PLAYING pos=0 dur=0 ;;
-        Paused) st=PAUSED_PLAYBACK pos=0 dur=0 ;;
-      esac
-    fi
+    [[ $ADEV_TYPE == dlna ]] && clock_tick "$st" "$pos" "$dur"
     at_end=0
     case $st in
       PLAYING | PAUSED_PLAYBACK)
@@ -2148,7 +2207,7 @@ wait_item_end() {
     ((others >= 2)) && return 3
     [[ $st == PLAYING ]] && ((saw && dur > 2 && pos >= dur - 1)) && at_end=1
     if ((at_end)); then ends=$((ends + 1)); else ends=0; fi
-    ((ends >= 2)) && return 0
+    ((ends >= 2)) && { [[ $st == PLAYING ]] || stop_confirmed "$ends" "$lpos" "$ldur" "$lt"; } && return 0
     if [[ $kind == image ]] && ((!last && t >= ${TVCAST_IMAGE_SECONDS:-10})); then
       ((saw)) && return 0
       return 4
@@ -2331,7 +2390,9 @@ cmd_run() {
     PLAYER_PID=$!
 
     rc=0
+    [[ $ADEV_TYPE == dlna && $kind != image ]] && clock_set "$resume_at" "$(media_seconds "$PLAY_FILE")"
     wait_item_end "$kind" "$last" "$blind" "$resume_at" || rc=$?
+    rm -f -- "$CLOCK_FILE"
     kill_player
     unpin
     rm -f -- "$CAST_MEDIA_FILE"
