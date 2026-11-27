@@ -46,6 +46,8 @@ STATE_FILE=$CACHE_DIR/state.json
 DEVICE_FILE=$CACHE_DIR/device
 LOG_FILE=$CACHE_DIR/session.log
 CLOCK_FILE=$CACHE_DIR/clock
+SEEK_MARK=$CACHE_DIR/seek.mark
+PLAY_MARK=$CACHE_DIR/play.mark
 STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/tvcast
 QUEUE_FILE=$STATE_DIR/queue.json
 LOCK_FILE=$STATE_DIR/lock
@@ -950,7 +952,19 @@ repause() { # repause: Pause, once more a second later; fails if neither took
   soap Pause >/dev/null 2>&1
 }
 
+# seek_pace: the TCL Google TV undoes a seek sent in the first seconds of
+# playback and can drop the video on seeks sent back to back, so seeks wait
+# for 10 s of playback and 3 s after the previous one.
+seek_pace() {
+  local m w=0 now=$EPOCHSECONDS
+  read -r m 2>/dev/null <"$PLAY_MARK" && [[ $m =~ ^[0-9]{1,12}$ ]] && ((m + 10 - now > w)) && w=$((m + 10 - now))
+  read -r m 2>/dev/null <"$SEEK_MARK" && [[ $m =~ ^[0-9]{1,12}$ ]] && ((m + 3 - now > w)) && w=$((m + 3 - now))
+  ((w > 0 && w <= 10)) && sleep "$w"
+  return 0
+}
+
 dlna_seek_once() {
+  seek_pace
   local target st paused="" SEEK_END=$((SECONDS + 10)) SOAP_MAX=5
   target=$(s_to_hms "$1")
   st=$(dlna_wait_state '^(PLAYING|PAUSED_PLAYBACK|STOPPED|NO_MEDIA_PRESENT)$' 20) || true
@@ -982,6 +996,7 @@ dlna_seek_once() {
     return 1
   fi
   clock_set "$1"
+  printf '%s\n' "$EPOCHSECONDS" >"$SEEK_MARK" 2>/dev/null
   if [[ -n $paused ]]; then
     sleep 1
     repause || { SEEK_ERR="The TV seeked but kept playing: it did not take Pause."; return 1; }
@@ -2148,6 +2163,15 @@ go2tv_screen() {
 # stop_confirmed <ends> <last-pos> <last-dur> <last-seen>: a DLNA TV that
 # reports STOPPED well before the end may just be seeking (the TCL Google TV
 # does while it rebuffers), so that needs TVCAST_STOP_CONFIRM seconds of it.
+# seek_drop <last-pos> <last-dur> <last-seen>: a DLNA TV stopped mid-file
+# within 90 s of a seek; the TCL Google TV drops the video like that.
+seek_drop() {
+  local m
+  [[ $ADEV_TYPE == dlna ]] || return 1
+  (($2 > 0 && $1 + SECONDS - $3 + 15 >= $2)) && return 1
+  read -r m 2>/dev/null <"$SEEK_MARK" && [[ $m =~ ^[0-9]{1,12}$ ]] && ((EPOCHSECONDS - m <= 90))
+}
+
 stop_confirmed() {
   local ends=$1 lpos=$2 ldur=$3 lt=$4 poll=${TVCAST_POLL_SECONDS:-2}
   [[ $ADEV_TYPE == dlna ]] || return 0
@@ -2175,7 +2199,10 @@ wait_item_end() {
         for _ in 1 2 3; do
           st=""
           read -r st _ < <(dev_status 2>/dev/null) || true
-          [[ $st == STOPPED || $st == NO_MEDIA_PRESENT ]] && return 0
+          if [[ $st == STOPPED || $st == NO_MEDIA_PRESENT ]]; then
+            seek_drop "$lpos" "$ldur" "$lt" && return 5
+            return 0
+          fi
           nap 1
         done
         return 2
@@ -2196,6 +2223,7 @@ wait_item_end() {
     at_end=0
     case $st in
       PLAYING | PAUSED_PLAYBACK)
+        ((saw)) || printf '%s\n' "$EPOCHSECONDS" >"$PLAY_MARK" 2>/dev/null
         saw=1 lpos=$pos ldur=$dur lt=$SECONDS lst=$st
         if ((resume_at > 2 && !resumed)) && [[ $st == PLAYING ]] && ((dur == 0 || resume_at < dur - 2)); then
           resumed=1
@@ -2207,7 +2235,10 @@ wait_item_end() {
     ((others >= 2)) && return 3
     [[ $st == PLAYING ]] && ((saw && dur > 2 && pos >= dur - 1)) && at_end=1
     if ((at_end)); then ends=$((ends + 1)); else ends=0; fi
-    ((ends >= 2)) && { [[ $st == PLAYING ]] || stop_confirmed "$ends" "$lpos" "$ldur" "$lt"; } && return 0
+    if ((ends >= 2)) && { [[ $st == PLAYING ]] || stop_confirmed "$ends" "$lpos" "$ldur" "$lt"; }; then
+      [[ $st != PLAYING ]] && seek_drop "$lpos" "$ldur" "$lt" && return 5
+      return 0
+    fi
     if [[ $kind == image ]] && ((!last && t >= ${TVCAST_IMAGE_SECONDS:-10})); then
       ((saw)) && return 0
       return 4
@@ -2234,7 +2265,7 @@ sweep_temps() {
 cmd_run() {
   trap 'kill_player; unpin' EXIT
   trap 'exit 0' TERM INT
-  local q count idx item file fid key title kind tc args name url last blind="" rc first="" first_key="" played=0 failed=0 unseen=0 want_audio=0 active_audio=0 want_sub="" resume_at=0
+  local q count idx item file fid key title kind tc args name url last blind="" rc first="" first_key="" played=0 failed=0 unseen=0 want_audio=0 active_audio=0 want_sub="" resume_at=0 drop_at=0 drop_key="" drops=0
   export TVCAST_IN_RUNNER=1
   rm -rf -- "$CACHE_DIR"/play.*
   sweep_temps
@@ -2390,12 +2421,28 @@ cmd_run() {
     PLAYER_PID=$!
 
     rc=0
-    [[ $ADEV_TYPE == dlna && $kind != image ]] && clock_set "$resume_at" "$(media_seconds "$PLAY_FILE")"
+    if [[ $ADEV_TYPE == dlna && $kind != image ]]; then
+      clock_set "$resume_at" "$(media_seconds "$PLAY_FILE")"
+      printf '%s\n' "$((EPOCHSECONDS + 5))" >"$PLAY_MARK" 2>/dev/null
+    fi
     wait_item_end "$kind" "$last" "$blind" "$resume_at" || rc=$?
-    rm -f -- "$CLOCK_FILE"
+    drop_at=0
+    ((rc == 5)) && read -r drop_at _ < <(clock_now STOPPED)
+    rm -f -- "$CLOCK_FILE" "$SEEK_MARK" "$PLAY_MARK"
     kill_player
     unpin
     rm -f -- "$CAST_MEDIA_FILE"
+    if ((rc == 5)); then
+      [[ $drop_key == "$key" ]] || drop_key=$key drops=0
+      drops=$((drops + 1))
+      if ((drops <= 3 && drop_at > 0)); then
+        notify low "Cast to TV" "$name dropped $title after a skip. Starting it again at $(s_to_hms "$drop_at")."
+        q_update --arg k "$key" --argjson pos "$drop_at" "$KEYPOS"' (keypos($k) as $p | if $p != null then .items[$p].resumeAt = $pos else . end)' ||
+          { write_state '{"active":false}'; die "$SAVE_ERR"; }
+        continue
+      fi
+      rc=0
+    fi
     if ((rc == 2)); then
       # The item did not finish: keep the queue on it.
       write_state '{"active":false}'
